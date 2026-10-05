@@ -33,18 +33,22 @@ See [ANDROID_AR_BACKEND_DECISION.md](ANDROID_AR_BACKEND_DECISION.md) and
 
 ## Supported toolchain
 
-Match [SUPPORTED_TOOLCHAIN.md](SUPPORTED_TOOLCHAIN.md). Treat Gradle/AGP bumps from this package as **documented maintenance releases**.
+- **Minimum:** Flutter **≥ 3.24** / Dart **≥ 3.5** (see [SUPPORTED_TOOLCHAIN.md](SUPPORTED_TOOLCHAIN.md)).
+- **Example / CI pin** (Gradle 9.3.1, AGP 9.1.0, `compileSdk` 37) is what *this repo*
+  builds with — not a hard requirement for every host. Prefer your Flutter version’s
+  default Android toolchain unless you hit a build conflict.
+- Treat Gradle/AGP bumps that change the **plugin** Android surface as **documented
+  maintenance releases**.
 
 ### Android (host app)
 
 | Setting | Value |
 |--------|--------|
-| Gradle wrapper | **9.3.1** |
-| Android Gradle Plugin | **9.1.0** |
-| `compileSdk` / `targetSdk` | **37** |
 | `minSdk` | **≥ 24** |
+| `compileSdk` | **≥ 34** (plugin compiles against 34; example uses 37) |
+| Gradle / AGP | Flutter’s defaults for your SDK are fine; example pins are optional |
 
-In `android/gradle.properties` (copy from the example until plugins migrate):
+If you copy the example’s Android project, you may also want:
 
 ```properties
 android.newDsl=false
@@ -60,7 +64,8 @@ android.useAndroidX=true
   `required` (use `tools:replace` when overriding the plugin; see the example app)
 - Optional-AR host: keep the package defaults so Play does not hide the app on non-AR devices
 
-If SDK Platform 37 installs as `platforms/android-37.0`, ensure Gradle can resolve `android-37` (symlink or reinstall platform).
+If the example’s SDK Platform 37 installs as `platforms/android-37.0`, ensure Gradle can
+resolve `android-37` (symlink or reinstall platform).
 
 ### iOS (host app)
 

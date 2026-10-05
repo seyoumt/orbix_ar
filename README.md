@@ -20,6 +20,12 @@ add pub.dev `arcore_flutter_plugin` to your app.
 3. **Undo** last tap/measurement if needed
 4. **Complete** → host receives a `MeasurementRecord`
 
+## Requirements
+
+- Flutter **≥ 3.24.0** / Dart **≥ 3.5.0**
+- Physical AR-capable Android (ARCore) or iOS (ARKit) device
+- Details: [SUPPORTED_TOOLCHAIN.md](doc/SUPPORTED_TOOLCHAIN.md)
+
 ## Install
 
 ```yaml

@@ -40,11 +40,12 @@ class ArMeasurementController extends ChangeNotifier {
     ARService? arService,
     Logger? logger,
     Future<bool> Function()? requestCameraPermission,
-    this._idleTimeout = const Duration(seconds: 60),
+    Duration idleTimeout = const Duration(seconds: 60),
   }) : _arService = arService ?? ARServiceFactory.createARService(),
        _logger = logger ?? Logger(),
        _requestCameraPermission =
-           requestCameraPermission ?? _defaultRequestCameraPermission;
+           requestCameraPermission ?? _defaultRequestCameraPermission,
+       _idleTimeout = idleTimeout;
 
   final ARService _arService;
   final Logger _logger;

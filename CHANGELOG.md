@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Broaden support to Flutter **≥ 3.24** / Dart **≥ 3.5** (was effectively 3.47 / 3.13 via `sdk: ^3.13.2`)
+- Widen runtime dependency ranges so older SDKs can resolve compatible transitive versions
+- Lower plugin `compileSdk` to **34**; document minimum vs CI-tested toolchain separately
+
 ## 0.1.0
 
 - Package and public API named `ar_measurement` (`ArMeasurementView`, `ArMeasurementController`, `MeasurementRecord`, …)
