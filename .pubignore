@@ -1,0 +1,45 @@
+# When .pubignore exists at the package root it replaces .gitignore for publish.
+# Keep this list complete.
+
+# Archives / spikes
+android_backends/
+
+# Libraries should not ship pubspec.lock
+/pubspec.lock
+
+# Build and tool caches
+.dart_tool/
+.packages
+.pub/
+build/
+**/build/
+coverage/
+.flutter-plugins
+.flutter-plugins-dependencies
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+.DS_Store
+
+# Plugin Android ephemerals
+android/.gradle/
+android/local.properties
+android/.cxx/
+
+# Example platform ephemerals / generated
+example/**/Flutter/ephemeral/
+example/**/.last_build_id
+example/ios/Pods/
+example/ios/.symlinks/
+example/android/.gradle/
+example/android/.kotlin/
+example/build/
+example/**/build/
+
+# Misc
+.widget_preview/
+*.class
+*.log

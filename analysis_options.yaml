@@ -1,0 +1,13 @@
+include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  exclude:
+    - build/**
+    # Example is its own package — analyze from example/ so its deps resolve
+    - example/**
+    # Archived Sceneform / spike leftovers — not on the production path
+    - android_backends/**
+    - android/**
+
+linter:
+  rules:

@@ -1,0 +1,66 @@
+group 'com.difrancescogianmarco.arcore_flutter_plugin'
+version '1.0-SNAPSHOT'
+
+// Patched for Gradle 9 / AGP 9: jcenter() removed, namespace added, Kotlin bumped,
+// Google Sceneform replaced with maintained fork (unique namespaces).
+buildscript {
+    ext.kotlin_version = '2.1.0'
+    repositories {
+        google()
+        mavenCentral()
+    }
+
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.7.3'
+        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+    }
+}
+
+rootProject.allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+apply plugin: 'com.android.library'
+apply plugin: 'kotlin-android'
+
+android {
+    namespace 'com.difrancescogianmarco.arcore_flutter_plugin'
+    compileSdk 37
+
+    sourceSets {
+        main.java.srcDirs += 'src/main/kotlin'
+    }
+    defaultConfig {
+        minSdkVersion 24
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+
+    lintOptions {
+        textReport = true
+    }
+}
+
+dependencies {
+    implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk7:$kotlin_version"
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    // MUST match Sceneform 1.23.0 (compiled against ARCore 1.31.0).
+    // Newer ARCore changes acquireEnvironmentalHdrCubeMap() to Image[] and crashes
+    // Sceneform with NoSuchMethodError looking for ArImage[].
+    implementation 'com.google.ar:core:1.31.0'
+    // Maintained Sceneform fork — Google's 1.17.1 AARs share namespace and fail AGP 8+/9.
+    implementation 'com.gorisse.thomas.sceneform:sceneform:1.23.0'
+    implementation 'androidx.core:core-ktx:1.12.0'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
+}
