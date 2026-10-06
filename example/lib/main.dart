@@ -285,7 +285,7 @@ class _CaptureScreenState extends State<CaptureScreen> {
   }
 }
 
-/// Host-owned overlay — same tool HUD pattern as the package default,
+/// Host-owned overlay — same reticle/Place flow as the package default,
 /// with host wording ("Save") to show customization.
 class _CustomOverlay extends StatelessWidget {
   const _CustomOverlay({required this.controller, required this.onComplete});
@@ -293,20 +293,16 @@ class _CustomOverlay extends StatelessWidget {
   final ArMeasurementController controller;
   final VoidCallback onComplete;
 
-  String get _instruction {
-    if (controller.isTrackingPaused) return 'Paused — tap to resume';
-    if (controller.hasActiveSession && !controller.isSceneReady) {
-      return 'Move slowly to find a surface';
-    }
+  String get _measureInstruction {
     switch (controller.phase) {
       case CapturePhase.idle:
         return 'Starting…';
       case CapturePhase.awaitingStart:
-        return 'Tap start point';
+        return 'Aim at the start point, then Place';
       case CapturePhase.awaitingEnd:
-        return 'Tap end point';
+        return 'Aim at the end point, then Place';
       case CapturePhase.readyToComplete:
-        return 'Tap to measure again';
+        return 'Place again for another segment, or Save';
     }
   }
 
@@ -322,6 +318,10 @@ class _CustomOverlay extends StatelessWidget {
         controller.hasActiveSession &&
         !controller.isSceneReady &&
         !controller.isTrackingPaused;
+    final measuring =
+        controller.hasActiveSession &&
+        controller.isSceneReady &&
+        !controller.isTrackingPaused;
     final paused = controller.isTrackingPaused;
     final last = controller.measurements.isEmpty
         ? null
@@ -332,82 +332,137 @@ class _CustomOverlay extends StatelessWidget {
       children: [
         if (paused)
           Positioned.fill(
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTap: () => controller.resumeTracking(),
+            child: ColoredBox(
+              color: Colors.black.withValues(alpha: 0.35),
+              child: Center(
+                child: FilledButton.tonal(
+                  onPressed: () => controller.resumeTracking(),
+                  child: const Text('Resume camera'),
+                ),
+              ),
+            ),
+          ),
+        if (scanning)
+          Positioned.fill(
+            child: IgnorePointer(
               child: ColoredBox(
-                color: Colors.black.withValues(alpha: 0.35),
-                child: const Center(
-                  child: _ExampleHudChip(
-                    child: Text(
-                      'Tap to resume camera',
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontSize: 15,
-                        fontWeight: FontWeight.w500,
-                      ),
+                color: Colors.black.withValues(alpha: 0.28),
+                child: Center(
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 32),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          Icons.phonelink_setup_rounded,
+                          size: 72,
+                          color: Colors.white.withValues(alpha: 0.92),
+                        ),
+                        const SizedBox(height: 16),
+                        const Text(
+                          'Move around to scan the area',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 20,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          'Look left, right, and across floors/walls so surfaces '
+                          'are mapped before measuring.',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: Colors.white.withValues(alpha: 0.82),
+                            fontSize: 14,
+                          ),
+                        ),
+                        const SizedBox(height: 18),
+                        SizedBox(
+                          width: 220,
+                          child: LinearProgressIndicator(
+                            value: controller.scanProgress <= 0
+                                ? null
+                                : controller.scanProgress.clamp(0.0, 1.0),
+                            minHeight: 6,
+                            backgroundColor: Colors.white.withValues(
+                              alpha: 0.2,
+                            ),
+                            color: const Color(0xFFF5C518),
+                          ),
+                        ),
+                      ],
                     ),
                   ),
                 ),
               ),
             ),
           ),
-        Positioned(
-          top: 0,
-          left: 0,
-          right: 0,
-          child: SafeArea(
-            bottom: false,
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Expanded(
-                    child: _ExampleHudChip(
-                      onTap: paused ? () => controller.resumeTracking() : null,
-                      child: Row(
-                        children: [
-                          if (scanning) ...[
-                            const SizedBox(
-                              width: 14,
-                              height: 14,
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2,
-                                color: Colors.white70,
-                              ),
-                            ),
-                            const SizedBox(width: 10),
-                          ],
-                          Expanded(
-                            child: Text(
-                              _instruction,
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 14,
-                                fontWeight: FontWeight.w500,
-                                height: 1.25,
-                              ),
-                            ),
+        if (measuring) ...[
+          Positioned(
+            top: 0,
+            left: 0,
+            right: 0,
+            child: SafeArea(
+              bottom: false,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: _ExampleHudChip(
+                        child: Text(
+                          _measureInstruction,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 14,
+                            fontWeight: FontWeight.w500,
                           ),
-                        ],
+                        ),
                       ),
                     ),
-                  ),
-                  if (canUndo) ...[
-                    const SizedBox(width: 8),
-                    _ExampleHudIconButton(
-                      tooltip: 'Undo',
-                      icon: Icons.undo_rounded,
-                      onPressed: () => controller.undoLastMeasurement(),
-                    ),
+                    if (canUndo) ...[
+                      const SizedBox(width: 8),
+                      _ExampleHudIconButton(
+                        tooltip: 'Undo',
+                        icon: Icons.undo_rounded,
+                        onPressed: () => controller.undoLastMeasurement(),
+                      ),
+                    ],
                   ],
-                ],
+                ),
               ),
             ),
           ),
-        ),
-        if (!paused && (last != null || canComplete))
+          if (last != null)
+            Positioned(
+              left: 16,
+              right: 16,
+              bottom: 108,
+              child: SafeArea(
+                top: false,
+                child: Center(
+                  child: Material(
+                    color: const Color(0xFFF5C518),
+                    borderRadius: BorderRadius.circular(8),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 8,
+                      ),
+                      child: Text(
+                        'Length=${(last.distanceMeters * 100).round()} cm',
+                        style: const TextStyle(
+                          color: Colors.black87,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
           Positioned(
             left: 0,
             right: 0,
@@ -415,82 +470,70 @@ class _CustomOverlay extends StatelessWidget {
             child: SafeArea(
               top: false,
               child: Padding(
-                padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-                child: _ExampleHudChip(
-                  child: Row(
-                    children: [
-                      Expanded(
-                        child: last == null
-                            ? const SizedBox.shrink()
-                            : Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Text(
-                                    last.distanceDisplay,
-                                    style: const TextStyle(
-                                      color: Colors.white,
-                                      fontSize: 16,
-                                      fontWeight: FontWeight.w600,
-                                      fontFeatures: [
-                                        FontFeature.tabularFigures(),
-                                      ],
-                                    ),
-                                  ),
-                                  if (controller.measurementCount > 1)
-                                    Text(
-                                      '${controller.measurementCount} measurements',
-                                      style: TextStyle(
-                                        color: Colors.white.withValues(
-                                          alpha: 0.7,
-                                        ),
-                                        fontSize: 12,
-                                      ),
-                                    ),
-                                ],
-                              ),
-                      ),
-                      if (canComplete)
-                        TextButton(
-                          onPressed: onComplete,
-                          style: TextButton.styleFrom(
-                            foregroundColor: Colors.white,
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 12,
-                              vertical: 8,
-                            ),
-                          ),
-                          child: const Text('Save'),
+                padding: const EdgeInsets.fromLTRB(20, 0, 20, 16),
+                child: Row(
+                  children: [
+                    if (canComplete)
+                      TextButton(
+                        onPressed: onComplete,
+                        style: TextButton.styleFrom(
+                          foregroundColor: Colors.white,
+                          backgroundColor: Colors.black.withValues(alpha: 0.45),
                         ),
-                    ],
-                  ),
+                        child: const Text('Save'),
+                      )
+                    else
+                      const SizedBox(width: 64),
+                    const Spacer(),
+                    Material(
+                      color: controller.canPlace
+                          ? const Color(0xFFF5C518)
+                          : Colors.white.withValues(alpha: 0.25),
+                      shape: const CircleBorder(),
+                      child: InkWell(
+                        customBorder: const CircleBorder(),
+                        onTap: controller.canPlace
+                            ? () => controller.placePoint()
+                            : null,
+                        child: SizedBox(
+                          width: 72,
+                          height: 72,
+                          child: Icon(
+                            Icons.add_rounded,
+                            size: 36,
+                            color: controller.canPlace
+                                ? Colors.black87
+                                : Colors.white54,
+                          ),
+                        ),
+                      ),
+                    ),
+                    const Spacer(),
+                    const SizedBox(width: 64),
+                  ],
                 ),
               ),
             ),
           ),
+        ],
       ],
     );
   }
 }
 
 class _ExampleHudChip extends StatelessWidget {
-  const _ExampleHudChip({required this.child, this.onTap});
+  const _ExampleHudChip({required this.child});
 
   final Widget child;
-  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
     return Material(
       color: Colors.black.withValues(alpha: 0.55),
       borderRadius: BorderRadius.circular(10),
-      child: InkWell(
-        onTap: onTap,
-        borderRadius: BorderRadius.circular(10),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-          child: child,
-        ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        child: child,
       ),
     );
   }

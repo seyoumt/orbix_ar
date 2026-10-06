@@ -16,6 +16,9 @@ class ChannelAndroidArService implements ARService {
   final _pointDetectionController = StreamController<ARPoint>.broadcast();
   final _planeDetectionController = StreamController<ARPlane>.broadcast();
   final _trackingReadyController = StreamController<void>.broadcast();
+  final _scanProgressController = StreamController<double>.broadcast();
+  final _aimValidController = StreamController<bool>.broadcast();
+  final _previewDistanceController = StreamController<double?>.broadcast();
   final _errorController = StreamController<String>.broadcast();
   final Set<String> _nodeIds = {};
 
@@ -23,6 +26,8 @@ class ChannelAndroidArService implements ARService {
   int? _attachedViewId;
   Completer<void>? _attachCompleter;
   bool _disposed = false;
+  bool _aimValid = false;
+  double? _lastPreviewDistance;
 
   bool get isAttached => _channel != null && !_disposed;
 
@@ -31,6 +36,16 @@ class ChannelAndroidArService implements ARService {
 
   @override
   Stream<void> get trackingReadyStream => _trackingReadyController.stream;
+
+  @override
+  Stream<double> get scanProgressStream => _scanProgressController.stream;
+
+  @override
+  Stream<bool> get aimValidStream => _aimValidController.stream;
+
+  @override
+  Stream<double?> get previewDistanceStream =>
+      _previewDistanceController.stream;
 
   /// Called from the preview when the platform view is created.
   void attach(int viewId) {
@@ -88,16 +103,15 @@ class ChannelAndroidArService implements ARService {
     if (_disposed) return;
     switch (call.method) {
       case 'onTap':
-        final args = Map<String, dynamic>.from(call.arguments as Map);
-        _pointDetectionController.add(
-          ARPoint(
-            x: (args['x'] as num).toDouble(),
-            y: (args['y'] as num).toDouble(),
-            z: (args['z'] as num).toDouble(),
-            label: 'tap',
-            timestamp: DateTime.now(),
-          ),
-        );
+        // Legacy tap placement disabled — ignore.
+        break;
+      case 'onAimChanged':
+        final valid = call.arguments == true;
+        if (_aimValid == valid) break;
+        _aimValid = valid;
+        if (!_aimValidController.isClosed) {
+          _aimValidController.add(valid);
+        }
         break;
       case 'onPlane':
         final args = Map<String, dynamic>.from(call.arguments as Map);
@@ -116,6 +130,25 @@ class ChannelAndroidArService implements ARService {
       case 'onTrackingReady':
         if (!_trackingReadyController.isClosed) {
           _trackingReadyController.add(null);
+        }
+        break;
+      case 'onScanProgress':
+        final value = (call.arguments as num?)?.toDouble() ?? 0;
+        if (!_scanProgressController.isClosed) {
+          _scanProgressController.add(value.clamp(0.0, 1.0));
+        }
+        break;
+      case 'onPreviewDistance':
+        final meters = (call.arguments as num?)?.toDouble();
+        if (_lastPreviewDistance == meters) break;
+        if (meters != null &&
+            _lastPreviewDistance != null &&
+            (meters - _lastPreviewDistance!).abs() < 0.002) {
+          break;
+        }
+        _lastPreviewDistance = meters;
+        if (!_previewDistanceController.isClosed) {
+          _previewDistanceController.add(meters);
         }
         break;
       case 'onError':
@@ -147,6 +180,59 @@ class ChannelAndroidArService implements ARService {
 
   @override
   Stream<ARPlane> get planeDetectionStream => _planeDetectionController.stream;
+
+  @override
+  Future<void> setAimingEnabled(bool enabled) async {
+    try {
+      await _invoke('setAimingEnabled', {'enabled': enabled});
+    } catch (e) {
+      _logger.w('setAimingEnabled failed: $e');
+    }
+    if (!enabled && _aimValid) {
+      _aimValid = false;
+      if (!_aimValidController.isClosed) {
+        _aimValidController.add(false);
+      }
+    }
+  }
+
+  @override
+  Future<ARPoint?> hitTestCenter() async {
+    await ensureReady();
+    final channel = _channel;
+    if (channel == null || _disposed) return null;
+    final result = await channel.invokeMethod<dynamic>('hitTestCenter');
+    if (result == null) return null;
+    final args = Map<String, dynamic>.from(result as Map);
+    return ARPoint(
+      x: (args['x'] as num).toDouble(),
+      y: (args['y'] as num).toDouble(),
+      z: (args['z'] as num).toDouble(),
+      label: 'aim',
+      timestamp: DateTime.now(),
+    );
+  }
+
+  @override
+  Future<void> setMeasurePreviewStart(ARPoint? point) async {
+    try {
+      if (point == null) {
+        await _invoke('setMeasurePreviewStart');
+        _lastPreviewDistance = null;
+        if (!_previewDistanceController.isClosed) {
+          _previewDistanceController.add(null);
+        }
+      } else {
+        await _invoke('setMeasurePreviewStart', {
+          'x': point.x,
+          'y': point.y,
+          'z': point.z,
+        });
+      }
+    } catch (e) {
+      _logger.w('setMeasurePreviewStart failed: $e');
+    }
+  }
 
   @override
   Future<void> showPointMarker(String nodeId, ARPoint point) async {
@@ -187,10 +273,15 @@ class ChannelAndroidArService implements ARService {
   Future<void> clearVisuals() async {
     await _invoke('clear');
     _nodeIds.clear();
+    _lastPreviewDistance = null;
+    if (!_previewDistanceController.isClosed) {
+      _previewDistanceController.add(null);
+    }
   }
 
   @override
   Future<void> pauseTracking() async {
+    await setAimingEnabled(false);
     await _invoke('pauseTracking');
   }
 
@@ -204,6 +295,9 @@ class ChannelAndroidArService implements ARService {
     _disposed = true;
     try {
       if (_channel != null) {
+        await _channel!.invokeMethod<void>('setAimingEnabled', {
+          'enabled': false,
+        });
         await _channel!.invokeMethod<void>('clear');
       }
     } catch (_) {}
@@ -214,6 +308,9 @@ class ChannelAndroidArService implements ARService {
     await _pointDetectionController.close();
     await _planeDetectionController.close();
     await _trackingReadyController.close();
+    await _scanProgressController.close();
+    await _aimValidController.close();
+    await _previewDistanceController.close();
     await _errorController.close();
   }
 

@@ -17,10 +17,10 @@ enum CapturePhase {
   /// No active session.
   idle,
 
-  /// Waiting for the start tap.
+  /// Waiting for the start point (Place).
   awaitingStart,
 
-  /// Start chosen; waiting for the end tap.
+  /// Start chosen; waiting for the end point (Place).
   awaitingEnd,
 
   /// At least one measurement; can complete.
@@ -65,13 +65,18 @@ class ArMeasurementController extends ChangeNotifier {
   bool _isSupported = false;
   bool _isSceneReady = false;
   bool _isTrackingPaused = false;
+  bool _aimValid = false;
+  double? _previewDistanceMeters;
+  double _scanProgress = 0;
   bool _initialized = false;
   bool _disposed = false;
   bool _pointHandling = false;
   Completer<void>? _initializeCompleter;
-  StreamSubscription<ARPoint>? _pointSub;
   StreamSubscription<String>? _errorSub;
   StreamSubscription<void>? _trackingReadySub;
+  StreamSubscription<double>? _scanProgressSub;
+  StreamSubscription<bool>? _aimValidSub;
+  StreamSubscription<double?>? _previewDistanceSub;
   Timer? _idleTimer;
 
   /// measurementId -> node ids in the AR scene
@@ -84,7 +89,7 @@ class ArMeasurementController extends ChangeNotifier {
   List<Measurement> get measurements =>
       List.unmodifiable(_activeRecord?.measurements ?? const []);
 
-  /// First tap awaiting an end point, if any.
+  /// First placed start point awaiting an end point, if any.
   ARPoint? get pendingStartPoint => _pendingStartPoint;
 
   /// Last user-facing error message, if any.
@@ -96,11 +101,28 @@ class ArMeasurementController extends ChangeNotifier {
   /// True after a successful support check.
   bool get isSupported => _isSupported;
 
-  /// True once AR has tracked a surface and taps can succeed.
+  /// True once the look-around scan finished and placement can succeed.
   bool get isSceneReady => _isSceneReady;
 
   /// True when the camera was paused after idle with no points set.
   bool get isTrackingPaused => _isTrackingPaused;
+
+  /// Look-around scan quality while coaching (`0.0`–`1.0`).
+  double get scanProgress => _scanProgress;
+
+  /// True when the center aim reticle is on a trackable plane.
+  bool get aimValid => _aimValid;
+
+  /// Live rubber-band length in meters while awaiting the end point, else `null`.
+  double? get previewDistanceMeters => _previewDistanceMeters;
+
+  /// True when the user can press Place (scene ready, aiming, not paused).
+  bool get canPlace =>
+      hasActiveSession &&
+      _isSceneReady &&
+      !_isTrackingPaused &&
+      _aimValid &&
+      !_pointHandling;
 
   /// Whether [startSession] has an open draft record.
   bool get hasActiveSession => _activeRecord != null;
@@ -149,14 +171,19 @@ class ArMeasurementController extends ChangeNotifier {
       if (!_isSupported) {
         throw ArMeasurementException('AR is not supported on this device.');
       }
-      await _pointSub?.cancel();
-      _pointSub = _arService.pointDetectionStream.listen(_onPointDetected);
       await _errorSub?.cancel();
       _errorSub = _arService.platformErrorStream.listen(_onPlatformError);
       await _trackingReadySub?.cancel();
       _trackingReadySub = _arService.trackingReadyStream.listen(
         (_) => _onTrackingReady(),
       );
+      await _scanProgressSub?.cancel();
+      _scanProgressSub = _arService.scanProgressStream.listen(_onScanProgress);
+      await _aimValidSub?.cancel();
+      _aimValidSub = _arService.aimValidStream.listen(_onAimValid);
+      await _previewDistanceSub?.cancel();
+      _previewDistanceSub =
+          _arService.previewDistanceStream.listen(_onPreviewDistance);
       _initialized = true;
       _error = null;
       _initializeCompleter!.complete();
@@ -187,17 +214,84 @@ class ArMeasurementController extends ChangeNotifier {
   void _onTrackingReady() {
     if (_disposed || _isSceneReady || _isTrackingPaused) return;
     _isSceneReady = true;
+    _scanProgress = 1;
+    unawaited(_syncAimingEnabled());
     notifyListeners();
   }
 
-  void _onPointDetected(ARPoint point) {
+  void _onScanProgress(double value) {
+    if (_disposed || _isSceneReady) return;
+    final next = value.clamp(0.0, 1.0);
+    if ((next - _scanProgress).abs() < 0.01) return;
+    _scanProgress = next;
+    notifyListeners();
+  }
+
+  void _onAimValid(bool valid) {
+    if (_disposed || _aimValid == valid) return;
+    _aimValid = valid;
+    notifyListeners();
+  }
+
+  void _onPreviewDistance(double? meters) {
+    if (_disposed) return;
+    if (_previewDistanceMeters == meters) return;
+    if (meters != null &&
+        _previewDistanceMeters != null &&
+        (meters - _previewDistanceMeters!).abs() < 0.002) {
+      return;
+    }
+    _previewDistanceMeters = meters;
+    notifyListeners();
+  }
+
+  Future<void> _syncMeasurePreview() async {
+    if (_disposed) return;
+    final start =
+        _pendingStartPoint != null && hasActiveSession && !_isTrackingPaused
+            ? _pendingStartPoint
+            : null;
+    try {
+      await _arService.setMeasurePreviewStart(start);
+    } catch (e, st) {
+      _logger.w('setMeasurePreviewStart failed: $e', error: e, stackTrace: st);
+    }
+    if (start == null && _previewDistanceMeters != null) {
+      _previewDistanceMeters = null;
+      if (!_disposed) notifyListeners();
+    }
+  }
+
+  Future<void> _syncAimingEnabled() async {
+    if (_disposed) return;
+    final enabled =
+        hasActiveSession && _isSceneReady && !_isTrackingPaused;
+    try {
+      await _arService.setAimingEnabled(enabled);
+    } catch (e, st) {
+      _logger.w('setAimingEnabled failed: $e', error: e, stackTrace: st);
+    }
+    if (!enabled && _aimValid) {
+      _aimValid = false;
+      if (!_disposed) notifyListeners();
+    }
+  }
+
+  /// Place a point at the current center aim hit (start, then end).
+  ///
+  /// Returns `true` if a point was accepted.
+  Future<bool> placePoint() async {
     if (_disposed ||
         _activeRecord == null ||
         _pointHandling ||
-        _isTrackingPaused) {
-      return;
+        _isTrackingPaused ||
+        !_isSceneReady) {
+      return false;
     }
-    unawaited(_handlePoint(point));
+    final point = await _arService.hitTestCenter();
+    if (point == null) return false;
+    await _handlePoint(point);
+    return true;
   }
 
   Future<void> _handlePoint(ARPoint point) async {
@@ -232,6 +326,7 @@ class ArMeasurementController extends ChangeNotifier {
     _cancelIdleTimer();
     try {
       await _arService.showPointMarker(_pendingMarkerId!, point);
+      await _syncMeasurePreview();
       _error = null;
     } catch (e, st) {
       _logger.e('Failed to show pending marker', error: e, stackTrace: st);
@@ -267,9 +362,11 @@ class ArMeasurementController extends ChangeNotifier {
     // Mark paused before native pause so a SessionPaused race is ignored.
     _isTrackingPaused = true;
     _isSceneReady = false;
+    _scanProgress = 0;
     _error = null;
     _cancelIdleTimer();
     notifyListeners();
+    await _syncAimingEnabled();
     try {
       await _arService.pauseTracking();
       if (_disposed) return;
@@ -290,8 +387,10 @@ class ArMeasurementController extends ChangeNotifier {
       if (_disposed) return;
       _isTrackingPaused = false;
       _isSceneReady = false;
+      _scanProgress = 0;
       _error = null;
       _resetIdleTimer();
+      await _syncAimingEnabled();
       notifyListeners();
     } catch (e, st) {
       _error = 'Failed to resume camera: $e';
@@ -320,6 +419,9 @@ class ArMeasurementController extends ChangeNotifier {
 
     await _ensureTrackingResumed();
     _isSceneReady = false;
+    _aimValid = false;
+    _scanProgress = 0;
+    await _syncAimingEnabled();
     try {
       await _arService.clearVisuals();
     } catch (e, st) {
@@ -339,6 +441,8 @@ class ArMeasurementController extends ChangeNotifier {
     );
     _pendingStartPoint = null;
     _pendingMarkerId = null;
+    _previewDistanceMeters = null;
+    await _syncMeasurePreview();
     _error = null;
     _resetIdleTimer();
     notifyListeners();
@@ -348,22 +452,28 @@ class ArMeasurementController extends ChangeNotifier {
   Future<void> cancelSession() async {
     _cancelIdleTimer();
     await _clearPendingMarker();
+    _pendingStartPoint = null;
+    await _syncMeasurePreview();
     await _ensureTrackingResumed();
     try {
       await _arService.clearVisuals();
     } catch (_) {}
     _visualNodes.clear();
     _activeRecord = null;
-    _pendingStartPoint = null;
     _isSceneReady = false;
+    _aimValid = false;
+    _scanProgress = 0;
+    _previewDistanceMeters = null;
+    await _syncAimingEnabled();
     _error = null;
     if (!_disposed) notifyListeners();
   }
 
-  /// Clear the pending first tap so the user can re-pick start.
+  /// Clear the pending first point so the user can re-pick start.
   Future<void> clearPendingPoint() async {
     await _clearPendingMarker();
     _pendingStartPoint = null;
+    await _syncMeasurePreview();
     _resetIdleTimer();
     if (!_disposed) notifyListeners();
   }
@@ -384,6 +494,7 @@ class ArMeasurementController extends ChangeNotifier {
     try {
       await _clearPendingMarker();
       _pendingStartPoint = null;
+      await _syncMeasurePreview();
       _cancelIdleTimer();
 
       final distance = MeasurementMath.distanceMeters(startPoint, endPoint);
@@ -432,7 +543,7 @@ class ArMeasurementController extends ChangeNotifier {
     if (!_disposed) notifyListeners();
   }
 
-  /// Undo the last measurement (and clear a pending start tap).
+  /// Undo the last measurement (and clear a pending start point).
   Future<void> undoLastMeasurement() async {
     if (_pendingStartPoint != null) {
       await clearPendingPoint();
@@ -472,14 +583,19 @@ class ArMeasurementController extends ChangeNotifier {
 
     _cancelIdleTimer();
     await _clearPendingMarker();
+    _pendingStartPoint = null;
+    await _syncMeasurePreview();
     await _ensureTrackingResumed();
     try {
       await _arService.clearVisuals();
     } catch (_) {}
     final record = _activeRecord!.copyWith(status: 'completed');
     _activeRecord = null;
-    _pendingStartPoint = null;
     _isSceneReady = false;
+    _aimValid = false;
+    _scanProgress = 0;
+    _previewDistanceMeters = null;
+    await _syncAimingEnabled();
     _visualNodes.clear();
     _error = null;
     if (!_disposed) notifyListeners();
@@ -490,9 +606,11 @@ class ArMeasurementController extends ChangeNotifier {
   void dispose() {
     _disposed = true;
     _cancelIdleTimer();
-    unawaited(_pointSub?.cancel());
     unawaited(_errorSub?.cancel());
     unawaited(_trackingReadySub?.cancel());
+    unawaited(_scanProgressSub?.cancel());
+    unawaited(_aimValidSub?.cancel());
+    unawaited(_previewDistanceSub?.cancel());
     unawaited(_arService.dispose());
     super.dispose();
   }

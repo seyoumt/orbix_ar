@@ -88,6 +88,25 @@ ArMeasurementView(
 
 Also check `controller.isSupported`, `controller.error`, and `controller.phase` (`CapturePhase`).
 
+## Capture interaction
+
+Default capture is **reticle + Place**, not tap-on-scene:
+
+1. While `!controller.isSceneReady`, show **look-around** coaching (not just “first plane”).
+   Drive a progress UI with `controller.scanProgress` (`0`–`1`). Unlock needs time +
+   camera yaw coverage + enough plane area/count.
+2. When ready, a native **oriented aim reticle** tracks the surface under screen center.
+3. Call `controller.placePoint()` (or use the default Place button) for start, then end.
+4. After the start point, a live rubber-band preview line tracks from start to the aim
+   reticle. Read `controller.previewDistanceMeters` for a live length chip (meters; `null`
+   when inactive or aim has no hit).
+5. Use `controller.canPlace` / `controller.aimValid` to enable Place in a custom `overlayBuilder`.
+6. `undoLastMeasurement()` clears a pending start or deletes the last segment.
+
+Scene taps are ignored for placement. Custom overlays should not rely on tap-to-place.
+Brief aim misses keep the last reticle/Place enabled for a short hold so the button
+does not flicker while looking around mapped surfaces.
+
 ## Quick embed
 
 ```dart

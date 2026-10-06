@@ -30,7 +30,6 @@ import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicReference
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 
@@ -81,11 +80,28 @@ class CustomArMeasurementView(
     private val viewMatrix = FloatArray(16)
     private val mvpMatrix = FloatArray(16)
     private val destroyed = AtomicBoolean(false)
-    private val pendingTap = AtomicReference<FloatArray?>(null)
-    /** One-shot: first TRACKING plane → Dart coaching can end. */
+    /** One-shot: look-around scan complete → Dart coaching can end. */
     private val trackingReadyEmitted = AtomicBoolean(false)
     /** Dart-requested thermal idle pause; Activity resume must not fight it. */
     private val idlePaused = AtomicBoolean(false)
+    /** When true, run center hit-test and draw the oriented aim reticle. */
+    private val aimingEnabled = AtomicBoolean(false)
+    private val aimHasHit = AtomicBoolean(false)
+    private var aimPose: Pose? = null
+    /** Keep last good aim briefly so Place does not flicker on brief misses. */
+    private var aimMissSinceMs = 0L
+    /** Rubber-band measure preview start (world); null when inactive. */
+    private var previewStart: FloatArray? = null
+    private var lastPreviewDistanceCm = -1
+    private val yawBuckets = BooleanArray(YAW_BUCKET_COUNT)
+    private var scanStartedElapsedMs = -1L
+    private var lastScanProgressEmit = -1
+    private val ringScratch = directFloatBuffer(FloatArray(99)) // 33 verts * 3 floats
+    /** Shared mesh scratch for UV spheres, disks, and plane outlines. */
+    private val meshScratch = directFloatBuffer(FloatArray(2400))
+    private val pointScratch = FloatArray(3)
+    private val worldScratch = FloatArray(3)
+    private val worldScratchB = FloatArray(3)
 
     // Instance-local UV / geometry scratch (not shared across views).
     private val quadCoordsBuffer: FloatBuffer = directFloatBuffer(
@@ -98,7 +114,6 @@ class CustomArMeasurementView(
         floatArrayOf(0f, 1f, 1f, 1f, 0f, 0f, 1f, 0f),
     )
     private val lineScratch = directFloatBuffer(FloatArray(6))
-    private val sphereScratch = directFloatBuffer(FloatArray(72)) // 24 verts * 3
 
     private val lifecycleObserver = object : DefaultLifecycleObserver {
         override fun onResume(owner: LifecycleOwner) {
@@ -195,6 +210,56 @@ class CustomArMeasurementView(
                 resumeTrackingFromIdle()
                 result.success(null)
             }
+            "setAimingEnabled" -> {
+                val enabled = call.argument<Boolean>("enabled") ?: false
+                aimingEnabled.set(enabled)
+                if (!enabled) {
+                    clearAimHit(force = true)
+                }
+                result.success(null)
+            }
+            "hitTestCenter" -> {
+                val pose = synchronized(sessionLock) { aimPose }
+                if (pose == null) {
+                    result.success(null)
+                    return
+                }
+                val t = pose.translation
+                // Create the placement anchor only on Place — not every aim frame.
+                synchronized(sessionLock) {
+                    pendingHitAnchor?.let { detachQuietly(it) }
+                    pendingHitAnchor = try {
+                        session?.createAnchor(pose)
+                    } catch (_: Exception) {
+                        null
+                    }
+                }
+                result.success(
+                    mapOf(
+                        "x" to t[0].toDouble(),
+                        "y" to t[1].toDouble(),
+                        "z" to t[2].toDouble(),
+                    ),
+                )
+            }
+            "setMeasurePreviewStart" -> {
+                val x = call.argument<Double>("x")
+                val y = call.argument<Double>("y")
+                val z = call.argument<Double>("z")
+                val cleared = synchronized(sessionLock) {
+                    previewStart = if (x == null || y == null || z == null) {
+                        null
+                    } else {
+                        floatArrayOf(x.toFloat(), y.toFloat(), z.toFloat())
+                    }
+                    previewStart == null
+                }
+                if (cleared) {
+                    lastPreviewDistanceCm = -1
+                    emitPreviewDistance(null)
+                }
+                result.success(null)
+            }
             else -> result.notImplemented()
         }
     }
@@ -210,6 +275,7 @@ class CustomArMeasurementView(
         if (destroyed.get()) return
         idlePaused.set(false)
         trackingReadyEmitted.set(false)
+        resetScanState()
         keepScreenOn = true
         onResume()
     }
@@ -315,8 +381,16 @@ class CustomArMeasurementView(
         pendingHitAnchor = null
         recycledPendingAnchor?.let { detachQuietly(it) }
         recycledPendingAnchor = null
+        aimPose = null
+        previewStart = null
+        lastPreviewDistanceCm = -1
+        if (aimHasHit.getAndSet(false)) {
+            emitAimChanged(false)
+        }
+        emitPreviewDistance(null)
         // Allow a new session to re-emit coaching ready after clearVisuals.
         trackingReadyEmitted.set(false)
+        resetScanState()
     }
 
     private fun detachQuietly(anchor: Anchor) {
@@ -327,44 +401,167 @@ class CustomArMeasurementView(
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        if (event.action == MotionEvent.ACTION_UP) {
-            // Capture coords before MotionEvent may be recycled.
-            pendingTap.set(floatArrayOf(event.x, event.y))
-        }
+        // Placement is via center reticle + Place button — ignore taps.
         return true
     }
 
-    /** Hit-test against [frame] only — never calls [Session.update]. */
-    private fun hitTest(frame: Frame, x: Float, y: Float) {
-        if (frame.camera.trackingState != TrackingState.TRACKING) return
-        val hits = frame.hitTest(x, y)
+    /**
+     * Center-screen plane hit for the aim reticle.
+     * Only updates [aimPose] for drawing — anchors are created on Place.
+     * Never calls [Session.update].
+     *
+     * Priority: in-polygon → in-extents → any Plane hit from hitTest (infinite
+     * plane beyond the mapped patch) → raycast onto the best tracked plane.
+     * Farther aim often misses the small mapped polygon; without the later
+     * steps the reticle disappears a few meters out.
+     */
+    private fun updateCenterAim(frame: Frame) {
+        if (!aimingEnabled.get()) return
+        if (frame.camera.trackingState != TrackingState.TRACKING) {
+            clearAimHit(force = true)
+            return
+        }
+        val cx = viewportWidth * 0.5f
+        val cy = viewportHeight * 0.5f
+        val hits = frame.hitTest(cx, cy)
+        var extentFallback: Pose? = null
+        var infinitePlaneFallback: Pose? = null
         for (hit in hits) {
             val trackable = hit.trackable
-            if (trackable is Plane &&
-                trackable.trackingState == TrackingState.TRACKING &&
-                trackable.isPoseInPolygon(hit.hitPose)
-            ) {
-                synchronized(sessionLock) {
-                    pendingHitAnchor?.let { detachQuietly(it) }
-                    pendingHitAnchor = try {
-                        hit.createAnchor()
-                    } catch (_: Exception) {
-                        null
-                    }
-                }
-                emitTap(hit.hitPose.translation)
+            if (trackable !is Plane || trackable.trackingState != TrackingState.TRACKING) {
+                continue
+            }
+            if (trackable.subsumedBy != null) continue
+            if (trackable.isPoseInPolygon(hit.hitPose)) {
+                acceptAimPose(hit.hitPose)
                 return
             }
+            if (extentFallback == null && trackable.isPoseInExtents(hit.hitPose)) {
+                extentFallback = hit.hitPose
+            }
+            // ARCore still returns Plane hits outside the mapped polygon/extents.
+            if (infinitePlaneFallback == null && hit.distance in AIM_MIN_DISTANCE..AIM_MAX_DISTANCE) {
+                infinitePlaneFallback = hit.hitPose
+            }
+        }
+        if (extentFallback != null) {
+            acceptAimPose(extentFallback)
+            return
+        }
+        if (infinitePlaneFallback != null) {
+            acceptAimPose(infinitePlaneFallback)
+            return
+        }
+        raycastBestPlane(frame)?.let {
+            acceptAimPose(it)
+            return
+        }
+        clearAimHit(force = false)
+    }
+
+    /**
+     * Intersect the camera forward ray with the largest tracked plane (expanded
+     * extents). Used when [Frame.hitTest] returns no usable Plane hit.
+     */
+    private fun raycastBestPlane(frame: Frame): Pose? {
+        val session = synchronized(sessionLock) { session } ?: return null
+        val camPose = frame.camera.pose
+        val origin = camPose.translation
+        pointScratch[0] = 0f
+        pointScratch[1] = 0f
+        pointScratch[2] = -1f
+        camPose.rotateVector(pointScratch, 0, worldScratch, 0)
+        val fx = worldScratch[0]
+        val fy = worldScratch[1]
+        val fz = worldScratch[2]
+
+        var bestPose: Pose? = null
+        var bestScore = -1f
+        try {
+            for (plane in session.getAllTrackables(Plane::class.java)) {
+                if (plane.trackingState != TrackingState.TRACKING) continue
+                if (plane.subsumedBy != null) continue
+                val center = plane.centerPose
+                pointScratch[0] = 0f
+                pointScratch[1] = 1f
+                pointScratch[2] = 0f
+                center.rotateVector(pointScratch, 0, worldScratchB, 0)
+                val nx = worldScratchB[0]
+                val ny = worldScratchB[1]
+                val nz = worldScratchB[2]
+                val denom = fx * nx + fy * ny + fz * nz
+                if (kotlin.math.abs(denom) < 1e-4f) continue
+                val pp = center.translation
+                val t =
+                    ((pp[0] - origin[0]) * nx +
+                        (pp[1] - origin[1]) * ny +
+                        (pp[2] - origin[2]) * nz) / denom
+                if (t < AIM_MIN_DISTANCE || t > AIM_MAX_DISTANCE) continue
+
+                val hx = origin[0] + fx * t
+                val hy = origin[1] + fy * t
+                val hz = origin[2] + fz * t
+                // Keep hits within expanded extents so we don't place on the sky.
+                pointScratch[0] = hx
+                pointScratch[1] = hy
+                pointScratch[2] = hz
+                val inv = center.inverse()
+                inv.transformPoint(pointScratch, 0, worldScratchB, 0)
+                val expand = AIM_EXTENT_EXPAND
+                if (kotlin.math.abs(worldScratchB[0]) > plane.extentX * expand) continue
+                if (kotlin.math.abs(worldScratchB[2]) > plane.extentZ * expand) continue
+
+                val area = plane.extentX * plane.extentZ
+                // Prefer large nearby planes.
+                val score = area / (0.5f + t)
+                if (score > bestScore) {
+                    bestScore = score
+                    bestPose = Pose(
+                        floatArrayOf(hx, hy, hz),
+                        center.rotationQuaternion,
+                    )
+                }
+            }
+        } catch (_: Exception) {
+            return null
+        }
+        return bestPose
+    }
+
+    private fun acceptAimPose(pose: Pose) {
+        synchronized(sessionLock) {
+            aimPose = pose
+        }
+        aimMissSinceMs = 0L
+        if (!aimHasHit.getAndSet(true)) {
+            emitAimChanged(true)
         }
     }
 
-    private fun emitTap(t: FloatArray) {
+    private fun clearAimHit(force: Boolean) {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (!force) {
+            if (aimMissSinceMs == 0L) {
+                aimMissSinceMs = now
+            }
+            if (now - aimMissSinceMs < AIM_HOLD_MS) {
+                // Keep last pose / Place enabled through brief gaps.
+                return
+            }
+        }
+        aimMissSinceMs = 0L
+        synchronized(sessionLock) {
+            aimPose = null
+        }
+        if (aimHasHit.getAndSet(false)) {
+            emitAimChanged(false)
+        }
+    }
+
+    private fun emitAimChanged(hasHit: Boolean) {
         activity.runOnUiThread {
             if (destroyed.get()) return@runOnUiThread
-            channel.invokeMethod(
-                "onTap",
-                mapOf("x" to t[0].toDouble(), "y" to t[1].toDouble(), "z" to t[2].toDouble()),
-            )
+            channel.invokeMethod("onAimChanged", hasHit)
         }
     }
 
@@ -375,6 +572,23 @@ class CustomArMeasurementView(
         }
     }
 
+    private fun emitScanProgress(progress: Float) {
+        val pct = (progress.coerceIn(0f, 1f) * 100f).toInt()
+        if (pct == lastScanProgressEmit) return
+        lastScanProgressEmit = pct
+        activity.runOnUiThread {
+            if (destroyed.get()) return@runOnUiThread
+            channel.invokeMethod("onScanProgress", progress.toDouble())
+        }
+    }
+
+    private fun emitPreviewDistance(meters: Double?) {
+        activity.runOnUiThread {
+            if (destroyed.get()) return@runOnUiThread
+            channel.invokeMethod("onPreviewDistance", meters)
+        }
+    }
+
     private fun emitError(message: String) {
         activity.runOnUiThread {
             if (destroyed.get()) return@runOnUiThread
@@ -382,32 +596,72 @@ class CustomArMeasurementView(
         }
     }
 
+    private fun resetScanState() {
+        scanStartedElapsedMs = -1L
+        lastScanProgressEmit = -1
+        yawBuckets.fill(false)
+        aimMissSinceMs = 0L
+    }
+
+    /**
+     * Look-around gate: time + camera yaw coverage + plane area/count.
+     * Avoids unlocking on the first tiny plane patch.
+     */
     private fun maybeEmitTrackingReady(frame: Frame) {
         if (trackingReadyEmitted.get()) return
         if (frame.camera.trackingState != TrackingState.TRACKING) return
-        val planes = frame.getUpdatedTrackables(Plane::class.java)
-        var hasTrackingPlane = false
-        for (plane in planes) {
-            if (plane.trackingState == TrackingState.TRACKING) {
-                hasTrackingPlane = true
-                break
+
+        val session = synchronized(sessionLock) { session } ?: return
+        var planeCount = 0
+        var maxArea = 0f
+        try {
+            for (plane in session.getAllTrackables(Plane::class.java)) {
+                if (plane.trackingState != TrackingState.TRACKING) continue
+                planeCount++
+                val area = plane.extentX * plane.extentZ
+                if (area > maxArea) maxArea = area
             }
+        } catch (_: Exception) {
+            return
         }
-        // updatedTrackables can miss already-known planes; also scan all.
-        if (!hasTrackingPlane) {
-            val session = synchronized(sessionLock) { session } ?: return
-            try {
-                for (plane in session.getAllTrackables(Plane::class.java)) {
-                    if (plane.trackingState == TrackingState.TRACKING) {
-                        hasTrackingPlane = true
-                        break
-                    }
-                }
-            } catch (_: Exception) {
-                return
-            }
+        if (planeCount == 0) {
+            emitScanProgress(0f)
+            return
         }
-        if (hasTrackingPlane && trackingReadyEmitted.compareAndSet(false, true)) {
+
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (scanStartedElapsedMs < 0L) {
+            scanStartedElapsedMs = now
+        }
+        val elapsed = now - scanStartedElapsedMs
+
+        // Sample camera look direction into yaw buckets ("look around").
+        try {
+            val zAxis = frame.camera.pose.zAxis
+            val yaw = kotlin.math.atan2(zAxis[0], zAxis[2])
+            val norm = ((yaw + Math.PI) / (2.0 * Math.PI))
+            val bucket = (norm * YAW_BUCKET_COUNT).toInt().coerceIn(0, YAW_BUCKET_COUNT - 1)
+            yawBuckets[bucket] = true
+        } catch (_: Exception) {
+        }
+        var filledBuckets = 0
+        for (b in yawBuckets) if (b) filledBuckets++
+
+        val timeScore = (elapsed.toFloat() / SCAN_MIN_MS).coerceIn(0f, 1f)
+        val lookScore = (filledBuckets.toFloat() / SCAN_MIN_YAW_BUCKETS).coerceIn(0f, 1f)
+        val areaScore = if (planeCount >= SCAN_MIN_PLANES) {
+            1f
+        } else {
+            (maxArea / SCAN_MIN_PLANE_AREA).coerceIn(0f, 1f)
+        }
+        val progress = minOf(timeScore, lookScore, areaScore)
+        emitScanProgress(progress)
+
+        val ready = elapsed >= SCAN_MIN_MS &&
+            filledBuckets >= SCAN_MIN_YAW_BUCKETS &&
+            (maxArea >= SCAN_MIN_PLANE_AREA || planeCount >= SCAN_MIN_PLANES)
+        if (ready && trackingReadyEmitted.compareAndSet(false, true)) {
+            emitScanProgress(1f)
             emitTrackingReady()
         }
     }
@@ -490,6 +744,7 @@ class CustomArMeasurementView(
             val config = Config(newSession)
             config.updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
             config.planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
+            config.focusMode = Config.FocusMode.AUTO
             config.lightEstimationMode = Config.LightEstimationMode.DISABLED
             config.instantPlacementMode = Config.InstantPlacementMode.DISABLED
             newSession.configure(config)
@@ -577,15 +832,23 @@ class CustomArMeasurementView(
         if (destroyed.get() || idlePaused.get()) return
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
         val frame: Frame
+        val activeSession: Session
         synchronized(sessionLock) {
             if (idlePaused.get()) return
             val session = session ?: return
             try {
+                // Flagships often change rotation/geometry; keep ARCore display in sync.
+                val rot = currentDisplayRotation()
+                if (rot != displayRotation) {
+                    displayRotation = rot
+                    session.setDisplayGeometry(displayRotation, viewportWidth, viewportHeight)
+                }
                 if (cameraTextureId >= 0 && cameraTextureId != boundCameraTextureId) {
                     session.setCameraTextureName(cameraTextureId)
                     boundCameraTextureId = cameraTextureId
                 }
                 frame = session.update()
+                activeSession = session
             } catch (_: SessionPausedException) {
                 // Expected during idle pause / Activity pause races — not an error.
                 return
@@ -601,12 +864,8 @@ class CustomArMeasurementView(
             }
         }
 
-        // Process queued tap against this frame only (no second update).
-        pendingTap.getAndSet(null)?.let { tap ->
-            hitTest(frame, tap[0], tap[1])
-        }
-
         maybeEmitTrackingReady(frame)
+        updateCenterAim(frame)
 
         quadTexCoordsBuffer.position(0)
         texCoordsBuffer.position(0)
@@ -623,27 +882,202 @@ class CustomArMeasurementView(
 
         GLES20.glUseProgram(markerProgram)
         GLES20.glEnable(GLES20.GL_DEPTH_TEST)
+        GLES20.glEnable(GLES20.GL_BLEND)
+        GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
         GLES20.glUniformMatrix4fv(mvpHandle, 1, false, mvpMatrix, 0)
 
-        GLES20.glUniform4f(colorHandle, 0.3f, 0.6f, 1f, 1f)
+        val poseForAim: Pose?
+        val previewFrom: FloatArray?
         val markerSnapshot: List<Anchor>
         val lineSnapshot: List<LineAnchors>
         synchronized(sessionLock) {
+            poseForAim = aimPose
+            previewFrom = previewStart?.clone()
             markerSnapshot = markers.values.toList()
             lineSnapshot = lines.values.toList()
         }
+
+        // Soft plane outlines for scan/measure coaching.
+        drawTrackedPlaneHints(activeSession)
+
+        // Rubber-band preview: start → current aim (pose only, no anchors).
+        if (previewFrom != null && poseForAim != null) {
+            val aimT = poseForAim.translation
+            GLES20.glUniform4f(colorHandle, 1f, 0.84f, 0.2f, 0.55f)
+            GLES20.glLineWidth(5f)
+            drawDashedLine(
+                previewFrom[0], previewFrom[1], previewFrom[2],
+                aimT[0], aimT[1], aimT[2],
+            )
+            maybeEmitPreviewDistance(previewFrom, aimT)
+        } else if (lastPreviewDistanceCm >= 0) {
+            lastPreviewDistanceCm = -1
+            emitPreviewDistance(null)
+        }
+
+        // Oriented aim reticle (lies on the hit plane).
+        if (aimingEnabled.get() && poseForAim != null) {
+            drawElegantReticle(poseForAim)
+        }
+
+        // Placed markers: white rim + gold core (smooth UV spheres).
         for (anchor in markerSnapshot) {
             translationOrNull(anchor)?.let { t ->
-                drawSphereApprox(t[0], t[1], t[2], 0.015f)
+                GLES20.glUniform4f(colorHandle, 1f, 1f, 1f, 1f)
+                drawUvSphere(t[0], t[1], t[2], 0.014f)
+                GLES20.glUniform4f(colorHandle, 0.96f, 0.77f, 0.09f, 1f)
+                drawUvSphere(t[0], t[1], t[2], 0.009f)
             }
         }
-        GLES20.glUniform4f(colorHandle, 1f, 1f, 0.2f, 1f)
+        // Committed segments.
+        GLES20.glUniform4f(colorHandle, 0.96f, 0.77f, 0.09f, 1f)
         GLES20.glLineWidth(6f)
         for (line in lineSnapshot) {
             val a = translationOrNull(line.start) ?: continue
             val b = translationOrNull(line.end) ?: continue
             drawLine(a[0], a[1], a[2], b[0], b[1], b[2])
         }
+
+        GLES20.glDisable(GLES20.GL_BLEND)
+    }
+
+    private fun maybeEmitPreviewDistance(start: FloatArray, end: FloatArray) {
+        val dx = end[0] - start[0]
+        val dy = end[1] - start[1]
+        val dz = end[2] - start[2]
+        val meters = kotlin.math.sqrt(dx * dx + dy * dy + dz * dz).toDouble()
+        val cm = (meters * 100.0).toInt()
+        if (cm == lastPreviewDistanceCm) return
+        lastPreviewDistanceCm = cm
+        emitPreviewDistance(meters)
+    }
+
+    private fun drawElegantReticle(pose: Pose) {
+        // Soft filled outer disk
+        GLES20.glUniform4f(colorHandle, 1f, 1f, 1f, 0.22f)
+        drawOrientedDisk(pose, 0.062f)
+        // White outer ring
+        GLES20.glUniform4f(colorHandle, 1f, 1f, 1f, 0.92f)
+        GLES20.glLineWidth(3f)
+        drawOrientedRing(pose, 0.058f)
+        // Gold inner ring
+        GLES20.glUniform4f(colorHandle, 0.96f, 0.77f, 0.09f, 1f)
+        GLES20.glLineWidth(3.5f)
+        drawOrientedRing(pose, 0.028f)
+        // Center pip
+        val t = pose.translation
+        GLES20.glUniform4f(colorHandle, 0.96f, 0.77f, 0.09f, 1f)
+        drawUvSphere(t[0], t[1], t[2], 0.007f)
+        // Tick marks (cross) in the plane
+        GLES20.glUniform4f(colorHandle, 1f, 1f, 1f, 0.9f)
+        GLES20.glLineWidth(2.5f)
+        drawOrientedTicks(pose, 0.034f, 0.05f)
+    }
+
+    private fun drawOrientedTicks(pose: Pose, inner: Float, outer: Float) {
+        val dirs = arrayOf(
+            floatArrayOf(1f, 0f, 0f),
+            floatArrayOf(-1f, 0f, 0f),
+            floatArrayOf(0f, 0f, 1f),
+            floatArrayOf(0f, 0f, -1f),
+        )
+        for (d in dirs) {
+            pointScratch[0] = d[0] * inner
+            pointScratch[1] = 0.001f
+            pointScratch[2] = d[2] * inner
+            pose.transformPoint(pointScratch, 0, worldScratch, 0)
+            pointScratch[0] = d[0] * outer
+            pointScratch[2] = d[2] * outer
+            pose.transformPoint(pointScratch, 0, worldScratchB, 0)
+            drawLine(
+                worldScratch[0], worldScratch[1], worldScratch[2],
+                worldScratchB[0], worldScratchB[1], worldScratchB[2],
+            )
+        }
+    }
+
+    private fun drawDashedLine(
+        x0: Float, y0: Float, z0: Float,
+        x1: Float, y1: Float, z1: Float,
+    ) {
+        val dx = x1 - x0
+        val dy = y1 - y0
+        val dz = z1 - z0
+        val len = kotlin.math.sqrt(dx * dx + dy * dy + dz * dz)
+        if (len < 0.01f) return
+        val ux = dx / len
+        val uy = dy / len
+        val uz = dz / len
+        val dash = 0.025f
+        var t = 0f
+        while (t < len) {
+            val t1 = (t + dash).coerceAtMost(len)
+            drawLine(
+                x0 + ux * t, y0 + uy * t, z0 + uz * t,
+                x0 + ux * t1, y0 + uy * t1, z0 + uz * t1,
+            )
+            t += dash * 2f
+        }
+    }
+
+    /** Low-alpha plane polygons + extent cross for coaching feedback. */
+    private fun drawTrackedPlaneHints(session: Session) {
+        GLES20.glUniform4f(colorHandle, 1f, 1f, 1f, 0.16f)
+        GLES20.glLineWidth(1.5f)
+        try {
+            for (plane in session.getAllTrackables(Plane::class.java)) {
+                if (plane.trackingState != TrackingState.TRACKING) continue
+                if (plane.subsumedBy != null) continue
+                drawPlaneOutline(plane)
+            }
+        } catch (_: Exception) {
+            // Session may be mid-teardown.
+        }
+    }
+
+    private fun drawPlaneOutline(plane: Plane) {
+        val pose = plane.centerPose
+        val poly = plane.polygon ?: return
+        poly.rewind()
+        val verts = poly.remaining() / 2
+        if (verts < 3) return
+        val count = verts.coerceAtMost(64)
+        meshScratch.clear()
+        pointScratch[1] = 0.002f
+        for (i in 0 until count) {
+            pointScratch[0] = poly.get(i * 2)
+            pointScratch[2] = poly.get(i * 2 + 1)
+            pose.transformPoint(pointScratch, 0, worldScratch, 0)
+            meshScratch.put(worldScratch[0]).put(worldScratch[1]).put(worldScratch[2])
+        }
+        meshScratch.position(0)
+        GLES20.glEnableVertexAttribArray(positionHandle)
+        GLES20.glVertexAttribPointer(positionHandle, 3, GLES20.GL_FLOAT, false, 0, meshScratch)
+        GLES20.glDrawArrays(GLES20.GL_LINE_LOOP, 0, count)
+        GLES20.glDisableVertexAttribArray(positionHandle)
+
+        // Light extent cross through plane center.
+        val hx = plane.extentX * 0.45f
+        val hz = plane.extentZ * 0.45f
+        pointScratch[0] = -hx
+        pointScratch[1] = 0.002f
+        pointScratch[2] = 0f
+        pose.transformPoint(pointScratch, 0, worldScratch, 0)
+        pointScratch[0] = hx
+        pose.transformPoint(pointScratch, 0, worldScratchB, 0)
+        drawLine(
+            worldScratch[0], worldScratch[1], worldScratch[2],
+            worldScratchB[0], worldScratchB[1], worldScratchB[2],
+        )
+        pointScratch[0] = 0f
+        pointScratch[2] = -hz
+        pose.transformPoint(pointScratch, 0, worldScratch, 0)
+        pointScratch[2] = hz
+        pose.transformPoint(pointScratch, 0, worldScratchB, 0)
+        drawLine(
+            worldScratch[0], worldScratch[1], worldScratch[2],
+            worldScratchB[0], worldScratchB[1], worldScratchB[2],
+        )
     }
 
     private fun translationOrNull(anchor: Anchor): FloatArray? {
@@ -698,23 +1132,87 @@ class CustomArMeasurementView(
         GLES20.glDisableVertexAttribArray(positionHandle)
     }
 
-    private fun drawSphereApprox(cx: Float, cy: Float, cz: Float, r: Float) {
-        val v = floatArrayOf(
-            cx, cy + r, cz, cx + r, cy, cz, cx, cy, cz + r,
-            cx, cy + r, cz, cx, cy, cz + r, cx - r, cy, cz,
-            cx, cy + r, cz, cx - r, cy, cz, cx, cy, cz - r,
-            cx, cy + r, cz, cx, cy, cz - r, cx + r, cy, cz,
-            cx, cy - r, cz, cx + r, cy, cz, cx, cy, cz + r,
-            cx, cy - r, cz, cx, cy, cz + r, cx - r, cy, cz,
-            cx, cy - r, cz, cx - r, cy, cz, cx, cy, cz - r,
-            cx, cy - r, cz, cx, cy, cz - r, cx + r, cy, cz,
-        )
-        sphereScratch.clear()
-        sphereScratch.put(v)
-        sphereScratch.position(0)
+    /** Ring in the local XZ plane of [pose] (Y ≈ surface normal for plane hits). */
+    private fun drawOrientedRing(pose: Pose, radius: Float) {
+        val segments = 32
+        ringScratch.clear()
+        for (i in 0..segments) {
+            val angle = (i.toFloat() / segments) * (Math.PI * 2.0).toFloat()
+            pointScratch[0] = kotlin.math.cos(angle) * radius
+            pointScratch[1] = 0.001f
+            pointScratch[2] = kotlin.math.sin(angle) * radius
+            pose.transformPoint(pointScratch, 0, worldScratch, 0)
+            ringScratch.put(worldScratch[0]).put(worldScratch[1]).put(worldScratch[2])
+        }
+        ringScratch.position(0)
         GLES20.glEnableVertexAttribArray(positionHandle)
-        GLES20.glVertexAttribPointer(positionHandle, 3, GLES20.GL_FLOAT, false, 0, sphereScratch)
-        GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, v.size / 3)
+        GLES20.glVertexAttribPointer(positionHandle, 3, GLES20.GL_FLOAT, false, 0, ringScratch)
+        GLES20.glDrawArrays(GLES20.GL_LINE_LOOP, 0, segments + 1)
+        GLES20.glDisableVertexAttribArray(positionHandle)
+    }
+
+    /** Filled disk in the local XZ plane of [pose]. */
+    private fun drawOrientedDisk(pose: Pose, radius: Float) {
+        val segments = 32
+        meshScratch.clear()
+        pointScratch[0] = 0f
+        pointScratch[1] = 0.001f
+        pointScratch[2] = 0f
+        pose.transformPoint(pointScratch, 0, worldScratch, 0)
+        meshScratch.put(worldScratch[0]).put(worldScratch[1]).put(worldScratch[2])
+        for (i in 0..segments) {
+            val angle = (i.toFloat() / segments) * (Math.PI * 2.0).toFloat()
+            pointScratch[0] = kotlin.math.cos(angle) * radius
+            pointScratch[1] = 0.001f
+            pointScratch[2] = kotlin.math.sin(angle) * radius
+            pose.transformPoint(pointScratch, 0, worldScratch, 0)
+            meshScratch.put(worldScratch[0]).put(worldScratch[1]).put(worldScratch[2])
+        }
+        meshScratch.position(0)
+        GLES20.glEnableVertexAttribArray(positionHandle)
+        GLES20.glVertexAttribPointer(positionHandle, 3, GLES20.GL_FLOAT, false, 0, meshScratch)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_FAN, 0, segments + 2)
+        GLES20.glDisableVertexAttribArray(positionHandle)
+    }
+
+    /** Smooth UV sphere (replaces faceted octahedron markers). */
+    private fun drawUvSphere(cx: Float, cy: Float, cz: Float, r: Float) {
+        val stacks = 8
+        val slices = 12
+        meshScratch.clear()
+        var vertCount = 0
+        for (i in 0 until stacks) {
+            val lat0 = (Math.PI * (-0.5 + i.toDouble() / stacks)).toFloat()
+            val lat1 = (Math.PI * (-0.5 + (i + 1).toDouble() / stacks)).toFloat()
+            val y0 = kotlin.math.sin(lat0)
+            val y1 = kotlin.math.sin(lat1)
+            val rr0 = kotlin.math.cos(lat0)
+            val rr1 = kotlin.math.cos(lat1)
+            for (j in 0 until slices) {
+                val lng0 = (2.0 * Math.PI * j / slices).toFloat()
+                val lng1 = (2.0 * Math.PI * (j + 1) / slices).toFloat()
+                val x00 = kotlin.math.cos(lng0) * rr0
+                val z00 = kotlin.math.sin(lng0) * rr0
+                val x01 = kotlin.math.cos(lng1) * rr0
+                val z01 = kotlin.math.sin(lng1) * rr0
+                val x10 = kotlin.math.cos(lng0) * rr1
+                val z10 = kotlin.math.sin(lng0) * rr1
+                val x11 = kotlin.math.cos(lng1) * rr1
+                val z11 = kotlin.math.sin(lng1) * rr1
+                meshScratch
+                    .put(cx + x00 * r).put(cy + y0 * r).put(cz + z00 * r)
+                    .put(cx + x10 * r).put(cy + y1 * r).put(cz + z10 * r)
+                    .put(cx + x11 * r).put(cy + y1 * r).put(cz + z11 * r)
+                    .put(cx + x00 * r).put(cy + y0 * r).put(cz + z00 * r)
+                    .put(cx + x11 * r).put(cy + y1 * r).put(cz + z11 * r)
+                    .put(cx + x01 * r).put(cy + y0 * r).put(cz + z01 * r)
+                vertCount += 6
+            }
+        }
+        meshScratch.position(0)
+        GLES20.glEnableVertexAttribArray(positionHandle)
+        GLES20.glVertexAttribPointer(positionHandle, 3, GLES20.GL_FLOAT, false, 0, meshScratch)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, vertCount)
         GLES20.glDisableVertexAttribArray(positionHandle)
     }
 
@@ -765,6 +1263,22 @@ class CustomArMeasurementView(
             fb.position(0)
             return fb
         }
+
+        /** Hold last aim pose through brief center-ray misses. */
+        private const val AIM_HOLD_MS = 700L
+        /** Ignore absurdly close / far aim hits (meters). */
+        private const val AIM_MIN_DISTANCE = 0.08f
+        private const val AIM_MAX_DISTANCE = 12f
+        /** Allow aim beyond mapped plane extents (mapped patch grows slowly). */
+        private const val AIM_EXTENT_EXPAND = 3.5f
+        /** Look-around scan: minimum time after first plane. */
+        private const val SCAN_MIN_MS = 2500L
+        private const val YAW_BUCKET_COUNT = 8
+        /** Distinct look directions required (of [YAW_BUCKET_COUNT]). */
+        private const val SCAN_MIN_YAW_BUCKETS = 3
+        /** ~0.5m × 0.5m plane, or at least [SCAN_MIN_PLANES] planes. */
+        private const val SCAN_MIN_PLANE_AREA = 0.25f
+        private const val SCAN_MIN_PLANES = 2
 
         private const val CAMERA_VERTEX = """
             attribute vec4 a_Position;

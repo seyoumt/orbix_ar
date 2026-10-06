@@ -8,12 +8,18 @@ class FakeARService implements ARService {
   final _points = StreamController<ARPoint>.broadcast();
   final _errors = StreamController<String>.broadcast();
   final _trackingReady = StreamController<void>.broadcast();
+  final _scanProgress = StreamController<double>.broadcast();
+  final _aimValid = StreamController<bool>.broadcast();
+  final _previewDistance = StreamController<double?>.broadcast();
   final List<String> markers = [];
   final List<String> lines = [];
   int pauseCount = 0;
   int resumeCount = 0;
   bool supported = true;
   bool ready = true;
+  bool aimingEnabled = false;
+  ARPoint? centerHit;
+  ARPoint? previewStart;
   Duration? readyDelay;
 
   void emitPoint(ARPoint point) => _points.add(point);
@@ -21,6 +27,12 @@ class FakeARService implements ARService {
   void emitError(String message) => _errors.add(message);
 
   void emitTrackingReady() => _trackingReady.add(null);
+
+  void emitScanProgress(double value) => _scanProgress.add(value);
+
+  void emitAimValid(bool valid) => _aimValid.add(valid);
+
+  void emitPreviewDistance(double? meters) => _previewDistance.add(meters);
 
   @override
   Future<void> initialize() async {}
@@ -35,6 +47,15 @@ class FakeARService implements ARService {
   Stream<void> get trackingReadyStream => _trackingReady.stream;
 
   @override
+  Stream<double> get scanProgressStream => _scanProgress.stream;
+
+  @override
+  Stream<bool> get aimValidStream => _aimValid.stream;
+
+  @override
+  Stream<double?> get previewDistanceStream => _previewDistance.stream;
+
+  @override
   Stream<String> get platformErrorStream => _errors.stream;
 
   @override
@@ -46,6 +67,22 @@ class FakeARService implements ARService {
     }
     if (!ready) {
       throw TimeoutException('Fake AR not ready', timeout);
+    }
+  }
+
+  @override
+  Future<void> setAimingEnabled(bool enabled) async {
+    aimingEnabled = enabled;
+  }
+
+  @override
+  Future<ARPoint?> hitTestCenter() async => centerHit;
+
+  @override
+  Future<void> setMeasurePreviewStart(ARPoint? point) async {
+    previewStart = point;
+    if (point == null) {
+      emitPreviewDistance(null);
     }
   }
 
@@ -76,6 +113,8 @@ class FakeARService implements ARService {
     await ensureReady();
     markers.clear();
     lines.clear();
+    previewStart = null;
+    emitPreviewDistance(null);
   }
 
   @override
@@ -93,6 +132,9 @@ class FakeARService implements ARService {
     await _points.close();
     await _errors.close();
     await _trackingReady.close();
+    await _scanProgress.close();
+    await _aimValid.close();
+    await _previewDistance.close();
   }
 
   @override

@@ -24,19 +24,27 @@ void main() {
   ARPoint point(double x, double y, double z) =>
       ARPoint(x: x, y: y, z: z, label: 'p', timestamp: DateTime(2026));
 
-  test(
-    'startSession then two taps create a measurement with visuals',
-    () async {
-      await controller.startSession();
-      expect(controller.phase, CapturePhase.awaitingStart);
+  Future<void> readyToPlace() async {
+    await controller.startSession();
+    fake.emitTrackingReady();
+    fake.emitAimValid(true);
+    await Future<void>.delayed(Duration.zero);
+  }
 
-      fake.emitPoint(point(0, 0, 0));
-      await Future<void>.delayed(Duration.zero);
+  test(
+    'startSession then two placePoint calls create a measurement',
+    () async {
+      await readyToPlace();
+      expect(controller.phase, CapturePhase.awaitingStart);
+      expect(controller.canPlace, isTrue);
+
+      fake.centerHit = point(0, 0, 0);
+      expect(await controller.placePoint(), isTrue);
       expect(controller.phase, CapturePhase.awaitingEnd);
       expect(fake.markers, contains('pending_start'));
 
-      fake.emitPoint(point(3, 4, 0));
-      await Future<void>.delayed(const Duration(milliseconds: 20));
+      fake.centerHit = point(3, 4, 0);
+      expect(await controller.placePoint(), isTrue);
 
       expect(controller.measurementCount, 1);
       expect(controller.measurements.first.distanceMeters, closeTo(5.0, 1e-9));
@@ -44,6 +52,31 @@ void main() {
       expect(fake.lines.length, 1);
     },
   );
+
+  test('placePoint returns false when center hit is null', () async {
+    await readyToPlace();
+    fake.centerHit = null;
+    expect(await controller.placePoint(), isFalse);
+    expect(controller.measurementCount, 0);
+    expect(controller.phase, CapturePhase.awaitingStart);
+  });
+
+  test('pending start enables measure preview; undo clears it', () async {
+    await readyToPlace();
+    fake.centerHit = point(1, 0, 0);
+    await controller.placePoint();
+    expect(controller.phase, CapturePhase.awaitingEnd);
+    expect(fake.previewStart, isNotNull);
+    expect(fake.previewStart!.x, 1);
+
+    fake.emitPreviewDistance(0.42);
+    await Future<void>.delayed(Duration.zero);
+    expect(controller.previewDistanceMeters, closeTo(0.42, 1e-9));
+
+    await controller.undoLastMeasurement();
+    expect(fake.previewStart, isNull);
+    expect(controller.previewDistanceMeters, isNull);
+  });
 
   test('undoLastMeasurement removes measurement and visuals', () async {
     await controller.startSession();
@@ -64,14 +97,14 @@ void main() {
   test(
     'undo clears pending start without removing completed measurements',
     () async {
-      await controller.startSession();
+      await readyToPlace();
       await controller.addMeasurement(
         name: 'M1',
         startPoint: point(0, 0, 0),
         endPoint: point(1, 0, 0),
       );
-      fake.emitPoint(point(2, 0, 0));
-      await Future<void>.delayed(Duration.zero);
+      fake.centerHit = point(2, 0, 0);
+      await controller.placePoint();
       expect(controller.phase, CapturePhase.awaitingEnd);
 
       await controller.undoLastMeasurement();
@@ -125,26 +158,6 @@ void main() {
     expect(denied.error, contains('Camera permission'));
   });
 
-  test('rapid taps serialize — only one pending start', () async {
-    await controller.startSession();
-    fake.emitPoint(point(0, 0, 0));
-    fake.emitPoint(point(1, 0, 0));
-    fake.emitPoint(point(2, 0, 0));
-    await Future<void>.delayed(const Duration(milliseconds: 50));
-
-    // First tap becomes start; second is processed as end → one measurement.
-    // Third is ignored while busy or becomes next start after measurement.
-    expect(controller.measurementCount, lessThanOrEqualTo(1));
-    if (controller.measurementCount == 0) {
-      expect(controller.phase, CapturePhase.awaitingEnd);
-    } else {
-      expect(
-        controller.phase,
-        anyOf(CapturePhase.readyToComplete, CapturePhase.awaitingEnd),
-      );
-    }
-  });
-
   test('platform errors surface on controller.error', () async {
     await controller.initialize();
     fake.emitError('Camera not available');
@@ -152,16 +165,24 @@ void main() {
     expect(controller.error, contains('Camera not available'));
   });
 
-  test('trackingReady sets isSceneReady after startSession', () async {
+  test('trackingReady sets isSceneReady and enables aiming', () async {
     await controller.startSession();
+    expect(controller.isSceneReady, isFalse);
+
+    fake.emitScanProgress(0.4);
+    await Future<void>.delayed(Duration.zero);
+    expect(controller.scanProgress, closeTo(0.4, 1e-9));
     expect(controller.isSceneReady, isFalse);
 
     fake.emitTrackingReady();
     await Future<void>.delayed(Duration.zero);
     expect(controller.isSceneReady, isTrue);
+    expect(controller.scanProgress, 1);
+    expect(fake.aimingEnabled, isTrue);
 
     await controller.startSession();
     expect(controller.isSceneReady, isFalse);
+    expect(controller.scanProgress, 0);
   });
 
   test('idle timeout pauses tracking when no points are set', () async {
@@ -193,10 +214,10 @@ void main() {
     addTearDown(idleController.dispose);
 
     await idleController.startSession();
-    fake.emitPoint(
-      ARPoint(x: 0, y: 0, z: 0, label: 'p', timestamp: DateTime(2026)),
-    );
+    fake.emitTrackingReady();
     await Future<void>.delayed(Duration.zero);
+    fake.centerHit = point(0, 0, 0);
+    await idleController.placePoint();
     expect(idleController.pendingStartPoint, isNotNull);
 
     await Future<void>.delayed(const Duration(milliseconds: 80));

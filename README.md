@@ -15,10 +15,11 @@ add pub.dev `arcore_flutter_plugin` to your app.
 
 ## Capture loop (verified vertical slice)
 
-1. Tap **start** point in the AR scene (marker appears)
-2. Tap **end** point (second marker + line; distance shown with ±7.5 cm margin)
-3. **Undo** last tap/measurement if needed
-4. **Complete** → host receives a `MeasurementRecord`
+1. **Scan** — move around until surfaces are detected (coaching UI)
+2. **Aim** — oriented 3D reticle follows the surface under screen center
+3. **Place (+)** start, then Place end → length segment (markers + line)
+4. **Undo** / delete last segment if needed; Place again for more segments
+5. **Done** → host receives a `MeasurementRecord`
 
 ## Requirements
 

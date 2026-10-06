@@ -189,7 +189,7 @@ class _ArMeasurementViewState extends State<ArMeasurementView> {
     if (Platform.isIOS) {
       return ARKitSceneView(
         key: _arPreviewKey,
-        enableTapRecognizer: true,
+        enableTapRecognizer: false,
         planeDetection: ARPlaneDetection.horizontalAndVertical,
         onARKitViewCreated: (arkitController) {
           final service = widget.controller.arService;
@@ -211,21 +211,22 @@ class _DefaultOverlay extends StatelessWidget {
   final ArMeasurementController controller;
   final VoidCallback onComplete;
 
-  String get _instruction {
-    if (controller.isTrackingPaused) return 'Paused — tap to resume';
-    if (controller.hasActiveSession && !controller.isSceneReady) {
-      return 'Move slowly to find a surface';
-    }
+  String get _measureInstruction {
     switch (controller.phase) {
       case CapturePhase.idle:
         return 'Starting…';
       case CapturePhase.awaitingStart:
-        return 'Tap start point';
+        return 'Aim at the start point, then Place';
       case CapturePhase.awaitingEnd:
-        return 'Tap end point';
+        return 'Aim at the end point, then Place';
       case CapturePhase.readyToComplete:
-        return 'Tap to measure again';
+        return 'Place again for another segment, or Done';
     }
+  }
+
+  String _lengthLabelMeters(double meters) {
+    final cm = (meters * 100).round();
+    return 'Length $cm cm';
   }
 
   @override
@@ -240,93 +241,93 @@ class _DefaultOverlay extends StatelessWidget {
         controller.hasActiveSession &&
         !controller.isSceneReady &&
         !controller.isTrackingPaused;
+    final measuring =
+        controller.hasActiveSession &&
+        controller.isSceneReady &&
+        !controller.isTrackingPaused;
     final paused = controller.isTrackingPaused;
     final last = controller.measurements.isEmpty
         ? null
         : controller.measurements.last;
+    final previewMeters = controller.previewDistanceMeters;
+    final showLivePreview =
+        controller.phase == CapturePhase.awaitingEnd && previewMeters != null;
 
-    // Stack + positioned chrome so empty regions pass taps to the AR view.
     return Stack(
       fit: StackFit.expand,
       children: [
         if (paused)
           Positioned.fill(
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTap: () => controller.resumeTracking(),
-              child: ColoredBox(
-                color: Colors.black.withValues(alpha: 0.35),
-                child: const Center(
-                  child: _HudChip(
-                    child: Text(
-                      'Tap to resume camera',
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontSize: 15,
-                        fontWeight: FontWeight.w500,
-                      ),
-                    ),
-                  ),
+            child: ColoredBox(
+              color: Colors.black.withValues(alpha: 0.35),
+              child: Center(
+                child: FilledButton.tonal(
+                  onPressed: () => controller.resumeTracking(),
+                  child: const Text('Resume camera'),
                 ),
               ),
             ),
           ),
-        Positioned(
-          top: 0,
-          left: 0,
-          right: 0,
-          child: SafeArea(
-            bottom: false,
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Expanded(
-                    child: _HudChip(
-                      onTap: paused ? () => controller.resumeTracking() : null,
-                      child: Row(
-                        children: [
-                          if (scanning) ...[
-                            const SizedBox(
-                              width: 14,
-                              height: 14,
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2,
-                                color: Colors.white70,
-                              ),
-                            ),
-                            const SizedBox(width: 10),
-                          ],
-                          Expanded(
-                            child: Text(
-                              _instruction,
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 14,
-                                fontWeight: FontWeight.w500,
-                                height: 1.25,
-                              ),
-                            ),
+        if (scanning) _ScanCoachingPanel(progress: controller.scanProgress),
+        if (measuring) ...[
+          Positioned(
+            top: 0,
+            left: 0,
+            right: 0,
+            child: SafeArea(
+              bottom: false,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: _HudChip(
+                        child: Text(
+                          _measureInstruction,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 14,
+                            fontWeight: FontWeight.w500,
+                            height: 1.25,
                           ),
-                        ],
+                        ),
                       ),
                     ),
-                  ),
-                  if (canUndo) ...[
-                    const SizedBox(width: 8),
-                    _HudIconButton(
-                      tooltip: 'Undo',
-                      icon: Icons.undo_rounded,
-                      onPressed: () => controller.undoLastMeasurement(),
-                    ),
+                    if (canUndo) ...[
+                      const SizedBox(width: 8),
+                      _HudIconButton(
+                        tooltip: 'Undo',
+                        icon: Icons.undo_rounded,
+                        onPressed: () => controller.undoLastMeasurement(),
+                      ),
+                    ],
                   ],
-                ],
+                ),
               ),
             ),
           ),
-        ),
-        if (!paused && (last != null || canComplete))
+          if (showLivePreview || last != null)
+            Positioned(
+              left: 16,
+              right: 16,
+              bottom: 108,
+              child: SafeArea(
+                top: false,
+                child: Center(
+                  child: showLivePreview
+                      ? _LengthChip(
+                          label: _lengthLabelMeters(previewMeters),
+                          live: true,
+                        )
+                      : _LengthChip(
+                          label: _lengthLabelMeters(last!.distanceMeters),
+                          onDelete: canUndo
+                              ? () => controller.undoLastMeasurement()
+                              : null,
+                        ),
+                ),
+              ),
+            ),
           Positioned(
             left: 0,
             right: 0,
@@ -334,83 +335,227 @@ class _DefaultOverlay extends StatelessWidget {
             child: SafeArea(
               top: false,
               child: Padding(
-                padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-                child: _HudChip(
-                  child: Row(
-                    children: [
-                      Expanded(
-                        child: last == null
-                            ? const SizedBox.shrink()
-                            : Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Text(
-                                    last.distanceDisplay,
-                                    style: const TextStyle(
-                                      color: Colors.white,
-                                      fontSize: 16,
-                                      fontWeight: FontWeight.w600,
-                                      fontFeatures: [
-                                        FontFeature.tabularFigures(),
-                                      ],
-                                    ),
-                                  ),
-                                  if (controller.measurementCount > 1)
-                                    Text(
-                                      '${controller.measurementCount} measurements',
-                                      style: TextStyle(
-                                        color: Colors.white.withValues(
-                                          alpha: 0.7,
-                                        ),
-                                        fontSize: 12,
-                                      ),
-                                    ),
-                                ],
-                              ),
-                      ),
-                      if (canComplete)
-                        TextButton(
-                          onPressed: onComplete,
-                          style: TextButton.styleFrom(
-                            foregroundColor: Colors.white,
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 12,
-                              vertical: 8,
-                            ),
-                          ),
-                          child: const Text('Done'),
+                padding: const EdgeInsets.fromLTRB(20, 0, 20, 16),
+                child: Row(
+                  children: [
+                    if (canComplete)
+                      TextButton(
+                        onPressed: onComplete,
+                        style: TextButton.styleFrom(
+                          foregroundColor: Colors.white,
+                          backgroundColor: Colors.black.withValues(alpha: 0.45),
                         ),
-                    ],
-                  ),
+                        child: const Text('Done'),
+                      )
+                    else
+                      const SizedBox(width: 64),
+                    const Spacer(),
+                    _PlaceButton(
+                      enabled: controller.canPlace,
+                      onPressed: () => controller.placePoint(),
+                    ),
+                    const Spacer(),
+                    const SizedBox(width: 64),
+                  ],
                 ),
               ),
             ),
           ),
+        ],
       ],
+    );
+  }
+}
+
+/// Dedicated scan coaching — shown until look-around scan completes.
+class _ScanCoachingPanel extends StatelessWidget {
+  const _ScanCoachingPanel({required this.progress});
+
+  final double progress;
+
+  @override
+  Widget build(BuildContext context) {
+    final pct = (progress.clamp(0.0, 1.0) * 100).round();
+    return Positioned.fill(
+      child: IgnorePointer(
+        child: ColoredBox(
+          color: Colors.black.withValues(alpha: 0.28),
+          child: Center(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 32),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    Icons.phonelink_setup_rounded,
+                    size: 72,
+                    color: Colors.white.withValues(alpha: 0.92),
+                  ),
+                  const SizedBox(height: 16),
+                  const Text(
+                    'Move around to scan the area',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 20,
+                      fontWeight: FontWeight.w600,
+                      height: 1.25,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Look left, right, and across floors/walls so surfaces '
+                    'are mapped before measuring.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      color: Colors.white.withValues(alpha: 0.82),
+                      fontSize: 14,
+                      height: 1.35,
+                    ),
+                  ),
+                  const SizedBox(height: 22),
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(4),
+                    child: SizedBox(
+                      width: 220,
+                      child: LinearProgressIndicator(
+                        value: progress <= 0 ? null : progress.clamp(0.0, 1.0),
+                        minHeight: 6,
+                        backgroundColor: Colors.white.withValues(alpha: 0.2),
+                        color: const Color(0xFFF5C518),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    progress <= 0 ? 'Detecting surfaces…' : 'Scanning… $pct%',
+                    style: TextStyle(
+                      color: Colors.white.withValues(alpha: 0.85),
+                      fontSize: 13,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _PlaceButton extends StatelessWidget {
+  const _PlaceButton({required this.enabled, required this.onPressed});
+
+  final bool enabled;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedOpacity(
+      duration: const Duration(milliseconds: 180),
+      opacity: enabled ? 1 : 0.55,
+      child: Material(
+        color: enabled
+            ? const Color(0xFFF5C518)
+            : Colors.white.withValues(alpha: 0.22),
+        shape: const CircleBorder(),
+        elevation: enabled ? 6 : 0,
+        shadowColor: const Color(0xAAF5C518),
+        child: InkWell(
+          customBorder: const CircleBorder(),
+          onTap: enabled ? onPressed : null,
+          child: SizedBox(
+            width: 76,
+            height: 76,
+            child: Icon(
+              Icons.add_rounded,
+              size: 38,
+              color: enabled ? const Color(0xFF1A1A1A) : Colors.white54,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _LengthChip extends StatelessWidget {
+  const _LengthChip({
+    required this.label,
+    this.onDelete,
+    this.live = false,
+  });
+
+  final String label;
+  final VoidCallback? onDelete;
+  final bool live;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: live ? const Color(0xE6F5C518) : const Color(0xFFF5C518),
+      borderRadius: BorderRadius.circular(10),
+      elevation: live ? 2 : 0,
+      shadowColor: const Color(0x66F5C518),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (live) ...[
+              Container(
+                width: 7,
+                height: 7,
+                decoration: const BoxDecoration(
+                  color: Color(0xFF1A1A1A),
+                  shape: BoxShape.circle,
+                ),
+              ),
+              const SizedBox(width: 8),
+            ],
+            Text(
+              label,
+              style: const TextStyle(
+                color: Color(0xFF1A1A1A),
+                fontSize: 16,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 0.2,
+              ),
+            ),
+            if (onDelete != null) ...[
+              const SizedBox(width: 6),
+              InkWell(
+                onTap: onDelete,
+                child: const Icon(
+                  Icons.delete_outline_rounded,
+                  size: 20,
+                  color: Color(0xFF1A1A1A),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
     );
   }
 }
 
 /// Compact translucent HUD surface — stays out of the way of the camera.
 class _HudChip extends StatelessWidget {
-  const _HudChip({required this.child, this.onTap});
+  const _HudChip({required this.child});
 
   final Widget child;
-  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
     return Material(
       color: Colors.black.withValues(alpha: 0.55),
       borderRadius: BorderRadius.circular(10),
-      child: InkWell(
-        onTap: onTap,
-        borderRadius: BorderRadius.circular(10),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-          child: child,
-        ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        child: child,
       ),
     );
   }

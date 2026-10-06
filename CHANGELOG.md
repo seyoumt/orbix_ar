@@ -5,6 +5,12 @@
 - Broaden support to Flutter **≥ 3.24** / Dart **≥ 3.5** (was effectively 3.47 / 3.13 via `sdk: ^3.13.2`)
 - Widen runtime dependency ranges so older SDKs can resolve compatible transitive versions
 - Lower plugin `compileSdk` to **34**; document minimum vs CI-tested toolchain separately
+- **Reticle capture:** replace tap-to-place with scan coaching + native oriented aim reticle + Place (`placePoint` / `canPlace` / `aimValid`)
+- Breaking UX: scene taps no longer place points; hosts should use Place or call `controller.placePoint()`
+- **Look-around scan gate:** `isSceneReady` waits for time + yaw coverage + plane area (not first plane only); `scanProgress` for coaching UI; short aim-hold to reduce Place flicker
+- **Live measure preview:** after the first Place, a rubber-band line follows the aim reticle until end Place; `previewDistanceMeters` + default HUD live length chip; refined gold/white markers, dashed preview line, and oriented reticle (no per-frame anchors)
+- **Android GLES polish:** alpha blending, UV-sphere markers, soft filled reticle, plane outline coaching, `FocusMode.AUTO`, aim hit-test extent fallback (Place still uses aim pose; SceneView remains archive-only)
+- **Android far aim:** keep reticle when looking past the mapped plane patch (infinite-plane hitTest + raycast onto expanded extents; longer aim-hold)
 
 ## 0.1.0
 
