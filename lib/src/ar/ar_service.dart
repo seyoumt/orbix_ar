@@ -131,19 +131,21 @@ class IOSARService extends ARService {
   bool _aimValid = false;
   bool _aimNodeAdded = false;
   bool _previewLineAdded = false;
+  /// True while a hit-test / reticle update is in flight (drops overlapping ticks).
+  bool _aimBusy = false;
   ARKitNode? _aimNode;
-  ARKitNode? _aimOuterNode;
-  ARKitNode? _aimCenterNode;
   ARPoint? _latestAimPoint;
   ARPoint? _previewStart;
   double? _lastPreviewDistance;
-  DateTime _lastAimUpdate = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime _lastPreviewLineUpdate = DateTime.fromMillisecondsSinceEpoch(0);
   DateTime? _aimMissSince;
   DateTime? _scanStartedAt;
   int _lastScanProgressPct = -1;
 
   static const _scanMin = Duration(milliseconds: 2500);
   static const _aimHold = Duration(milliseconds: 450);
+  /// Preview line remove+add is costly; keep reticle fast and rebuild line slower.
+  static const _previewLineMinInterval = Duration(milliseconds: 90);
   static const _minYawBuckets = 3;
   static const _yawBucketCount = 8;
   static const _minPlaneArea = 0.25;
@@ -346,20 +348,20 @@ class IOSARService extends ARService {
   }
 
   Future<void> _updateAimReticle() async {
-    if (_disposed || !_aimingEnabled) return;
-    final now = DateTime.now();
-    // ~15 Hz — hitTest via platform channel is expensive if run every frame.
-    if (now.difference(_lastAimUpdate) < const Duration(milliseconds: 66)) {
+    if (_disposed || !_aimingEnabled || _aimBusy) return;
+    // Serialize: one hit-test at a time; next frame runs as soon as this finishes
+    // (no fixed 15 Hz throttle — that made the reticle feel laggy).
+    _aimBusy = true;
+    final controller = _arkitController;
+    if (controller == null) {
+      _aimBusy = false;
       return;
     }
-    _lastAimUpdate = now;
-
-    final controller = _arkitController;
-    if (controller == null) return;
 
     try {
       // performHitTest requires x,y in (0, 1]; center of the view.
       final hits = await controller.performHitTest(x: 0.5, y: 0.5);
+      if (_disposed || !_aimingEnabled) return;
       final hit = _preferredPlaneHit(hits);
       if (hit == null) {
         await _clearAimWithHold();
@@ -367,14 +369,37 @@ class IOSARService extends ARService {
       }
 
       _aimMissSince = null;
-      _latestAimPoint = _pointFromHit(hit);
+      final point = _pointFromHit(hit);
+      _latestAimPoint = point;
+      // Single parent transform (children ride along) — one channel write.
       await _showAimNode(hit.worldTransform);
-      await _updatePreviewLine(_latestAimPoint!);
+      _maybeUpdatePreview(point);
       _emitAimValid(true);
     } catch (e, st) {
       _logger.w('Aim reticle update failed: $e', error: e, stackTrace: st);
       await _clearAimWithHold(force: true);
+    } finally {
+      _aimBusy = false;
     }
+  }
+
+  void _maybeUpdatePreview(ARPoint aim) {
+    final start = _previewStart;
+    if (start == null) {
+      _emitPreviewDistance(null);
+      return;
+    }
+    final dx = aim.x - start.x;
+    final dy = aim.y - start.y;
+    final dz = aim.z - start.z;
+    _emitPreviewDistance(math.sqrt(dx * dx + dy * dy + dz * dz));
+
+    final now = DateTime.now();
+    if (now.difference(_lastPreviewLineUpdate) < _previewLineMinInterval) {
+      return;
+    }
+    _lastPreviewLineUpdate = now;
+    unawaited(_rebuildPreviewLine(start, aim));
   }
 
   Future<void> _clearAimWithHold({bool force = false}) async {
@@ -410,8 +435,7 @@ class IOSARService extends ARService {
 
   Future<void> _updatePreviewLine(ARPoint aim) async {
     final start = _previewStart;
-    final controller = _arkitController;
-    if (start == null || controller == null || _disposed) {
+    if (start == null || _disposed) {
       await _hidePreviewLine();
       _emitPreviewDistance(null);
       return;
@@ -420,9 +444,16 @@ class IOSARService extends ARService {
     final dy = aim.y - start.y;
     final dz = aim.z - start.z;
     _emitPreviewDistance(math.sqrt(dx * dx + dy * dy + dz * dz));
+    _lastPreviewLineUpdate = DateTime.now();
+    await _rebuildPreviewLine(start, aim);
+  }
 
-    // Rebuild line each update — ARKitLine geometry is static once added.
+  Future<void> _rebuildPreviewLine(ARPoint start, ARPoint aim) async {
+    final controller = _arkitController;
+    if (controller == null || _disposed || _previewStart == null) return;
+    // Rebuild — ARKitLine geometry is static once added.
     await _hidePreviewLine();
+    if (_disposed || _previewStart == null) return;
     final line = ARKitLine(
       fromVector: vector.Vector3(start.x, start.y, start.z),
       toVector: vector.Vector3(aim.x, aim.y, aim.z),
@@ -467,7 +498,11 @@ class IOSARService extends ARService {
         lightingModelName: ARKitLightingModel.constant,
         diffuse: ARKitMaterialProperty.color(_accent),
       );
-      // Thin torus lies in the local XZ plane; hit pose Y ≈ surface normal.
+      // Parent carries world pose; children are local — one transform write/frame.
+      final parent = ARKitNode(
+        name: _aimNodeId,
+        transformation: worldTransform,
+      );
       final outer = ARKitNode(
         name: _aimOuterId,
         geometry: ARKitTorus(
@@ -475,33 +510,27 @@ class IOSARService extends ARService {
           pipeRadius: 0.0025,
           materials: [outerMat],
         ),
-        transformation: worldTransform,
       );
-      final node = ARKitNode(
-        name: _aimNodeId,
+      final ring = ARKitNode(
+        name: '${_aimNodeId}_ring',
         geometry: ARKitTorus(
           ringRadius: 0.03,
           pipeRadius: 0.0035,
           materials: [ringMat],
         ),
-        transformation: worldTransform,
       );
       final center = ARKitNode(
         name: _aimCenterId,
         geometry: ARKitSphere(radius: 0.007, materials: [centerMat]),
-        transformation: worldTransform,
       );
-      await controller.add(outer);
-      await controller.add(node);
-      await controller.add(center);
-      _aimOuterNode = outer;
-      _aimNode = node;
-      _aimCenterNode = center;
+      await controller.add(parent);
+      await controller.add(outer, parentNodeName: _aimNodeId);
+      await controller.add(ring, parentNodeName: _aimNodeId);
+      await controller.add(center, parentNodeName: _aimNodeId);
+      _aimNode = parent;
       _aimNodeAdded = true;
     } else {
-      _aimOuterNode?.transform = worldTransform;
       _aimNode!.transform = worldTransform;
-      _aimCenterNode?.transform = worldTransform;
     }
   }
 
@@ -509,18 +538,20 @@ class IOSARService extends ARService {
     if (!_aimNodeAdded) return;
     final controller = _arkitController;
     if (controller == null) return;
+    // Children first, then parent (SceneKit may not cascade via plugin remove).
     try {
       await controller.remove(_aimOuterId);
     } catch (_) {}
     try {
-      await controller.remove(_aimNodeId);
+      await controller.remove('${_aimNodeId}_ring');
     } catch (_) {}
     try {
       await controller.remove(_aimCenterId);
     } catch (_) {}
-    _aimOuterNode = null;
+    try {
+      await controller.remove(_aimNodeId);
+    } catch (_) {}
     _aimNode = null;
-    _aimCenterNode = null;
     _aimNodeAdded = false;
   }
 

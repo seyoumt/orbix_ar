@@ -11,6 +11,7 @@
 - **Live measure preview:** after the first Place, a rubber-band line follows the aim reticle until end Place; `previewDistanceMeters` + default HUD live length chip; refined gold/white markers, dashed preview line, and oriented reticle (no per-frame anchors)
 - **Android GLES polish:** alpha blending, UV-sphere markers, soft filled reticle, plane outline coaching, `FocusMode.AUTO`, aim hit-test extent fallback (Place still uses aim pose; SceneView remains archive-only)
 - **Android far aim:** keep reticle when looking past the mapped plane patch (infinite-plane hitTest + raycast onto expanded extents; longer aim-hold)
+- **iOS reticle latency:** drop fixed 15 Hz aim throttle; serialize hit-tests; single parent-node transform; throttle preview-line rebuild separately so aim stays smooth
 
 ## 0.1.0
 
