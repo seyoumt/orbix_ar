@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **AR preflight:** `ArMeasurement.checkAvailability()` / `isSupported()` — camera-free device check before opening capture (`ArAvailability` / `ArAvailabilityStatus`)
 - Broaden support to Flutter **≥ 3.24** / Dart **≥ 3.5** (was effectively 3.47 / 3.13 via `sdk: ^3.13.2`)
 - Widen runtime dependency ranges so older SDKs can resolve compatible transitive versions
 - Lower plugin `compileSdk` to **34**; document minimum vs CI-tested toolchain separately

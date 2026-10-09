@@ -10,6 +10,7 @@ import 'package:vector_math/vector_math_64.dart' as vector;
 
 import '../models/measurement_record.dart';
 import 'android/android_ar_backend.dart';
+import 'ar_availability.dart';
 
 export 'android/android_ar_backend.dart';
 
@@ -719,9 +720,7 @@ class IOSARService extends ARService {
   }
 
   @override
-  Future<bool> isSupported() async {
-    return ARKitPlugin.checkConfiguration(ARKitConfiguration.worldTracking);
-  }
+  Future<bool> isSupported() async => ArMeasurement.isSupported();
 }
 
 /// Factory to create the correct AR service based on platform.

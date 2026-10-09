@@ -47,6 +47,13 @@ dependencies:
 ```dart
 import 'package:ar_measurement/ar_measurement.dart';
 
+// Camera-free preflight — gate the entry button before opening AR.
+final availability = await ArMeasurement.checkAvailability();
+if (!availability.isSupported) {
+  // Hide / disable Measure; show availability.message
+  return;
+}
+
 final controller = ArMeasurementController();
 
 Navigator.of(context).push(
@@ -58,7 +65,7 @@ Navigator.of(context).push(
           Navigator.pop(context, record);
         },
         onError: (e) {
-          // AR unsupported / init failed — show fallback UI
+          // Permission / init failed — show fallback UI
         },
       ),
     ),
@@ -90,7 +97,7 @@ await store.save(record);
 - Gradle **9.3.1**, AGP **9.1**, `compileSdk`/`targetSdk` **37**, `minSdk` ≥ **24**
 - Plugin declares ARCore / `camera.ar` / GLES as **optional** (app installs on non-AR devices)
 - For AR-only apps, override to `required` in the host manifest (see example)
-- Handle unsupported devices via `onError` / `controller.isSupported`
+- Gate entry with `ArMeasurement.checkAvailability()`; still handle `onError` / `controller.isSupported`
 - `android.newDsl=false` and `android.builtInKotlin=false` (see example)
 - Production backend: custom ARCore + GLES ([decision](doc/ANDROID_AR_BACKEND_DECISION.md))
 
@@ -119,7 +126,7 @@ Owner verification steps: [doc/OWNER_VERIFY.md](doc/OWNER_VERIFY.md).
 
 | Import | Contents |
 |--------|----------|
-| `ar_measurement.dart` | `ArMeasurementView`, `ArMeasurementController`, `CapturePhase`, models, `ARService` / `ARServiceFactory`, `MeasurementMath` |
+| `ar_measurement.dart` | `ArMeasurement` / `ArAvailability`, `ArMeasurementView`, `ArMeasurementController`, `CapturePhase`, models, `ARService` / `ARServiceFactory`, `MeasurementMath` |
 | `persistence.dart` | `MeasurementRecordStore`, `SqliteMeasurementRecordStore` |
 
 Platform classes (`IOSARService`, Android channel services) are **not** exported. Do not import `src/` from host apps.

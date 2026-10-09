@@ -11,6 +11,8 @@
 /// ```
 library;
 
+export 'src/ar/ar_availability.dart'
+    show ArAvailability, ArAvailabilityStatus, ArMeasurement;
 export 'src/ar/ar_service.dart' show ARService, ARServiceFactory;
 export 'src/controller/ar_measurement_controller.dart'
     show ArMeasurementController, CapturePhase;

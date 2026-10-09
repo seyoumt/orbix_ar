@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import 'package:logger/logger.dart';
 
 import '../../models/measurement_record.dart';
+import '../ar_availability.dart';
 import '../ar_service.dart';
 
 /// Shared Dart side for the custom ARCore platform view.
@@ -315,15 +316,5 @@ class ChannelAndroidArService implements ARService {
   }
 
   @override
-  Future<bool> isSupported() async {
-    try {
-      const availability = MethodChannel(
-        'ar_measurement/availability',
-      );
-      final result = await availability.invokeMethod<bool>('isArCoreSupported');
-      return result == true;
-    } catch (_) {
-      return false;
-    }
-  }
+  Future<bool> isSupported() async => ArMeasurement.isSupported();
 }

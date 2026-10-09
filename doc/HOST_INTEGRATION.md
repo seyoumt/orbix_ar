@@ -72,9 +72,29 @@ resolve `android-37` (symlink or reinstall platform).
 - `NSCameraUsageDescription` in `Info.plist`
 - ARKit-capable device for capture; add `arkit` under `UIRequiredDeviceCapabilities` if the app requires AR
 
+## Preflight: check AR before opening capture
+
+Call a **camera-free** availability check on a home/settings screen so you can hide or
+disable “Measure in AR” without mounting `ArMeasurementView` or requesting the camera:
+
+```dart
+final availability = await ArMeasurement.checkAvailability();
+if (!availability.isSupported) {
+  // Disable entry / show availability.message
+  return;
+}
+// Navigate to ArMeasurementView only when supported
+```
+
+Convenience: `await ArMeasurement.isSupported()` → `bool`.
+
+This uses ARCore availability (Android) or ARKit world-tracking configuration (iOS).
+Web and desktop report unsupported. It does **not** request camera permission.
+
 ## Runtime: AR is not always available
 
-Unsupported hardware / denied camera / init failure is a **runtime** condition, not a successful measurement session.
+Unsupported hardware / denied camera / init failure is still a **runtime** condition after
+you open capture. Preflight is not enough alone:
 
 ```dart
 ArMeasurementView(

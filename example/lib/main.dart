@@ -38,11 +38,34 @@ class _HomeScreenState extends State<HomeScreen> {
   final _store = SqliteMeasurementRecordStore();
   List<MeasurementRecord> _history = [];
   bool _loading = true;
+  ArAvailability? _availability;
+  bool _availabilityLoading = true;
 
   @override
   void initState() {
     super.initState();
     _loadHistory();
+    _loadAvailability();
+  }
+
+  Future<void> _loadAvailability() async {
+    setState(() => _availabilityLoading = true);
+    try {
+      final availability = await ArMeasurement.checkAvailability();
+      if (mounted) {
+        setState(() {
+          _availability = availability;
+          _availabilityLoading = false;
+        });
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _availability = ArAvailability.unsupportedDevice;
+          _availabilityLoading = false;
+        });
+      }
+    }
   }
 
   Future<void> _loadHistory() async {
@@ -76,6 +99,19 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _openCapture({required bool customOverlay}) async {
+    final availability = _availability ?? await ArMeasurement.checkAvailability();
+    if (!mounted) return;
+    if (!availability.isSupported) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            availability.message ?? 'AR is not supported on this device.',
+          ),
+        ),
+      );
+      return;
+    }
+
     final location = await _currentLocation();
     if (!mounted) return;
 
@@ -111,6 +147,8 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final muted = theme.colorScheme.onSurfaceVariant;
+    final arReady = _availability?.isSupported == true;
+    final captureEnabled = !_availabilityLoading && arReady;
 
     return Scaffold(
       appBar: AppBar(title: const Text('AR Measurement'), centerTitle: false),
@@ -125,18 +163,27 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
           const SizedBox(height: 4),
           Text(
-            'Needs a physical ARCore / ARKit device. '
-            'Errors surface via onError — not as an empty success.',
+            _availabilityLoading
+                ? 'Checking AR support…'
+                : arReady
+                    ? 'Needs a physical ARCore / ARKit device. '
+                        'Errors surface via onError — not as an empty success.'
+                    : (_availability?.message ??
+                        'AR is not supported on this device.'),
             style: theme.textTheme.bodyMedium?.copyWith(color: muted),
           ),
           const SizedBox(height: 16),
           FilledButton(
-            onPressed: () => _openCapture(customOverlay: false),
+            onPressed: captureEnabled
+                ? () => _openCapture(customOverlay: false)
+                : null,
             child: const Text('Start capture'),
           ),
           const SizedBox(height: 8),
           OutlinedButton(
-            onPressed: () => _openCapture(customOverlay: true),
+            onPressed: captureEnabled
+                ? () => _openCapture(customOverlay: true)
+                : null,
             child: const Text('Start with custom overlay'),
           ),
           const SizedBox(height: 28),
